@@ -69,7 +69,7 @@
 
   <properties>
     <javaVersion>7</javaVersion>
-    <mavenVersion>3.0</mavenVersion>
+    <mavenVersion>3.6.2</mavenVersion>
   </properties>
 
   <dependencies>
