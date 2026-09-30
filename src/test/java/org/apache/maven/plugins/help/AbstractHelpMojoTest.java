@@ -18,51 +18,45 @@
  */
 package org.apache.maven.plugins.help;
 
-import org.apache.maven.plugin.MojoExecutionException;
-import org.eclipse.aether.artifact.Artifact;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.plugins.help.AbstractHelpMojo.Coordinates;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * Tests the coordinate parsing in {@link AbstractHelpMojo#getAetherArtifact(String, String)}.
+ * Tests the coordinate parsing in {@link AbstractHelpMojo#parseCoordinates(String)}.
  */
 class AbstractHelpMojoTest {
 
-    private final AbstractHelpMojo mojo = new AbstractHelpMojo(null, null) {
-        @Override
-        public void execute() {}
-    };
-
     @Test
-    void coordinatesWithoutAVersionGetTheLatestMetaversion() throws Exception {
-        Artifact artifact = mojo.getAetherArtifact("org.apache.maven:maven-core", "pom");
+    void coordinatesWithoutAVersionAskForTheLatestVersion() throws Exception {
+        Coordinates coordinates = AbstractHelpMojo.parseCoordinates("org.apache.maven:maven-core");
 
-        assertEquals("org.apache.maven", artifact.getGroupId());
-        assertEquals("maven-core", artifact.getArtifactId());
-        assertEquals("pom", artifact.getExtension());
-        // The literal, not the constant: leaving the version out has to keep producing a
-        // metaversion the resolver recognises. A null version would arrive here as "" instead.
-        assertEquals("LATEST", artifact.getVersion());
+        assertEquals("org.apache.maven", coordinates.groupId);
+        assertEquals("maven-core", coordinates.artifactId);
+        // null, not an empty version: the version has to be resolved to the latest one
+        assertNull(coordinates.version);
     }
 
     @Test
     void coordinatesWithAVersionKeepIt() throws Exception {
-        Artifact artifact = mojo.getAetherArtifact("org.apache.maven:maven-core:3.9.16", "pom");
+        Coordinates coordinates = AbstractHelpMojo.parseCoordinates("org.apache.maven:maven-core:3.9.16");
 
-        assertEquals("3.9.16", artifact.getVersion());
+        assertEquals("3.9.16", coordinates.version);
     }
 
     @Test
     void coordinatesWithTooManyPartsAreRejected() {
         assertThrows(
-                MojoExecutionException.class,
-                () -> mojo.getAetherArtifact("org.apache.maven:maven-core:3.9.16:extra", "pom"));
+                MojoException.class,
+                () -> AbstractHelpMojo.parseCoordinates("org.apache.maven:maven-core:3.9.16:extra"));
     }
 
     @Test
     void emptyCoordinatesAreRejected() {
-        assertThrows(IllegalArgumentException.class, () -> mojo.getAetherArtifact("", "pom"));
+        assertThrows(IllegalArgumentException.class, () -> AbstractHelpMojo.parseCoordinates(""));
     }
 }

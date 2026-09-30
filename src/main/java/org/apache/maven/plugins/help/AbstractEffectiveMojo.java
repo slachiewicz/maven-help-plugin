@@ -20,23 +20,13 @@ package org.apache.maven.plugins.help;
 
 import javax.xml.XMLConstants;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
-import java.io.Writer;
-import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Properties;
-import java.util.Set;
+import java.nio.file.Path;
 
-import org.apache.maven.project.ProjectBuilder;
 import org.codehaus.plexus.util.xml.XMLWriter;
 import org.codehaus.plexus.util.xml.XmlWriterUtil;
-import org.eclipse.aether.RepositorySystem;
 import org.jdom2.Document;
 import org.jdom2.JDOMException;
 import org.jdom2.input.SAXBuilder;
@@ -51,27 +41,16 @@ import org.jdom2.output.XMLOutputter;
  */
 public abstract class AbstractEffectiveMojo extends AbstractHelpMojo {
 
-    protected AbstractEffectiveMojo(ProjectBuilder projectBuilder, RepositorySystem repositorySystem) {
-        super(projectBuilder, repositorySystem);
-    }
-
     /**
      * Utility method to write an XML content to a given file.
      *
      * @param output is the wanted output file.
      * @param content contains the XML content to be written to the file.
      * @throws IOException if any
-     * @see AbstractHelpMojo#writeFile(File, String) if encoding is null.
+     * @see AbstractHelpMojo#writeFile(Path, String)
      */
-    protected static void writeXmlFile(File output, String content) throws IOException {
-        if (output == null) {
-            return;
-        }
-
-        output.getParentFile().mkdirs();
-        try (Writer out = Files.newBufferedWriter(output.toPath())) {
-            out.write(content);
-        }
+    protected static void writeXmlFile(Path output, String content) throws IOException {
+        writeFile(output, content);
     }
 
     /**
@@ -129,25 +108,6 @@ public abstract class AbstractEffectiveMojo extends AbstractHelpMojo {
             return w.toString();
         } catch (JDOMException | IOException e) {
             return effectiveModel;
-        }
-    }
-
-    /**
-     * Properties which provides a sorted keySet().
-     */
-    protected static class SortedProperties extends Properties {
-        /** serialVersionUID */
-        static final long serialVersionUID = -8985316072702233744L;
-
-        /** {@inheritDoc} */
-        @SuppressWarnings({"rawtypes", "unchecked"})
-        @Override
-        public Set<Object> keySet() {
-            Set<Object> keynames = super.keySet();
-            List list = new ArrayList(keynames);
-            Collections.sort(list);
-
-            return new LinkedHashSet<>(list);
         }
     }
 }

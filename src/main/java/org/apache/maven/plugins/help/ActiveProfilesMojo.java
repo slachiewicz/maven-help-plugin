@@ -18,18 +18,17 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.project.ProjectBuilder;
-import org.eclipse.aether.RepositorySystem;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.model.Profile;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
 
 /**
  * Displays a list of the profiles which are currently active for this build.
@@ -38,31 +37,16 @@ import org.eclipse.aether.RepositorySystem;
  */
 @Mojo(name = "active-profiles", aggregator = true)
 public class ActiveProfilesMojo extends AbstractHelpMojo {
-    // ----------------------------------------------------------------------
-    // Mojo parameters
-    // ----------------------------------------------------------------------
-
-    /**
-     * This is the list of projects currently slated to be built by Maven.
-     */
-    @Parameter(defaultValue = "${reactorProjects}", required = true, readonly = true)
-    private List<MavenProject> projects;
-
-    @Inject
-    public ActiveProfilesMojo(ProjectBuilder projectBuilder, RepositorySystem repositorySystem) {
-        super(projectBuilder, repositorySystem);
-    }
 
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
-    /** {@inheritDoc} */
     @Override
-    public void execute() throws MojoExecutionException {
+    public void execute() throws MojoException {
         StringBuilder message = new StringBuilder();
 
-        for (MavenProject project : projects) {
+        for (Project project : session.getProjects()) {
             getActiveProfileStatement(project, message);
 
             message.append(LS).append(LS);
@@ -74,17 +58,17 @@ public class ActiveProfilesMojo extends AbstractHelpMojo {
             sb.append("See: https://maven.apache.org/plugins/maven-help-plugin/")
                     .append(LS)
                     .append(LS);
-            sb.append(message.toString());
+            sb.append(message);
 
             try {
                 writeFile(output, sb);
             } catch (IOException e) {
-                throw new MojoExecutionException("Cannot write active profiles to output: " + output, e);
+                throw new MojoException("Cannot write active profiles to output: " + output, e);
             }
 
-            getLog().info("Active profile report written to: " + output);
+            log.info("Active profile report written to: " + output);
         } else {
-            getLog().info(message);
+            log.info(message);
         }
     }
 
@@ -92,14 +76,28 @@ public class ActiveProfilesMojo extends AbstractHelpMojo {
     // Private methods
     // ----------------------------------------------------------------------
 
-    /**
-     * Method to get the active profiles for the project
-     *
-     * @param project   the current project
-     * @param message   the object where the information will be appended to
-     */
-    private void getActiveProfileStatement(MavenProject project, StringBuilder message) {
-        Map<String, List<String>> activeProfileIds = project.getInjectedProfileIds();
+    private void getActiveProfileStatement(Project project, StringBuilder message) {
+        // The profiles that the POMs of the project and of its parents activated by model id, then the ones that
+        // settings.xml activated.
+        Map<String, List<String>> activeProfileIds = new LinkedHashMap<>();
+        List<Project> lineage = new ArrayList<>();
+        for (Optional<Project> p = Optional.of(project);
+                p.isPresent();
+                p = p.get().getParent()) {
+            lineage.add(0, p.get());
+        }
+        for (Project p : lineage) {
+            for (Profile profile : p.getDeclaredActiveProfiles()) {
+                if (Profile.SOURCE_POM.equals(profile.getSource())) {
+                    addProfileId(activeProfileIds, modelId(p), profile.getId());
+                }
+            }
+        }
+        for (Profile profile : project.getEffectiveActiveProfiles()) {
+            if (!Profile.SOURCE_POM.equals(profile.getSource())) {
+                addProfileId(activeProfileIds, "external", profile.getId());
+            }
+        }
 
         message.append(LS);
         message.append("Active Profiles for Project '").append(project.getId()).append("':");
@@ -119,5 +117,16 @@ public class ActiveProfilesMojo extends AbstractHelpMojo {
         }
 
         message.append(LS);
+    }
+
+    private static void addProfileId(Map<String, List<String>> ids, String source, String profileId) {
+        List<String> list = ids.computeIfAbsent(source, k -> new ArrayList<>());
+        if (!list.contains(profileId)) {
+            list.add(profileId);
+        }
+    }
+
+    private static String modelId(Project project) {
+        return project.getGroupId() + ":" + project.getArtifactId() + ":" + project.getVersion();
     }
 }

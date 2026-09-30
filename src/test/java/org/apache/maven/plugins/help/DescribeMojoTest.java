@@ -18,43 +18,59 @@
  */
 package org.apache.maven.plugins.help;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.lifecycle.DefaultLifecycles;
-import org.apache.maven.lifecycle.Lifecycle;
-import org.apache.maven.lifecycle.internal.MojoDescriptorCreator;
-import org.apache.maven.lifecycle.mapping.LifecycleMapping;
-import org.apache.maven.lifecycle.mapping.LifecyclePhase;
-import org.apache.maven.model.Plugin;
-import org.apache.maven.plugin.MavenPluginManager;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.descriptor.MojoDescriptor;
-import org.apache.maven.plugin.descriptor.Parameter;
-import org.apache.maven.plugin.descriptor.PluginDescriptor;
-import org.apache.maven.plugin.version.PluginVersionRequest;
-import org.apache.maven.plugin.version.PluginVersionResolver;
-import org.apache.maven.plugin.version.PluginVersionResult;
+import org.apache.maven.api.ArtifactCoordinates;
+import org.apache.maven.api.DownloadedArtifact;
+import org.apache.maven.api.Lifecycle;
+import org.apache.maven.api.Packaging;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.model.Build;
+import org.apache.maven.api.model.Model;
+import org.apache.maven.api.model.Plugin;
+import org.apache.maven.api.model.PluginContainer;
+import org.apache.maven.api.model.PluginExecution;
+import org.apache.maven.api.model.PluginManagement;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.descriptor.MojoDescriptor;
+import org.apache.maven.api.plugin.descriptor.Parameter;
+import org.apache.maven.api.plugin.descriptor.PluginDescriptor;
+import org.apache.maven.api.services.LifecycleRegistry;
+import org.apache.maven.api.services.ProjectBuilder;
+import org.apache.maven.api.services.ProjectBuilderRequest;
+import org.apache.maven.api.services.ProjectManager;
+import org.apache.maven.api.services.xml.ModelXmlFactory;
+import org.apache.maven.api.services.xml.PluginXmlFactory;
+import org.apache.maven.api.settings.Settings;
+import org.apache.maven.impl.DefaultModelXmlFactory;
+import org.apache.maven.impl.DefaultPluginXmlFactory;
+import org.apache.maven.plugins.help.DescribeMojo.LoadedPlugin;
 import org.apache.maven.plugins.help.DescribeMojo.PluginInfo;
-import org.apache.maven.project.MavenProject;
-import org.eclipse.aether.RepositorySystemSession;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
+import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -65,54 +81,135 @@ import static org.mockito.Mockito.when;
  */
 class DescribeMojoTest {
 
+    private static final String PLUGIN_XML = "<plugin>\n"
+            + "  <name>Test Plugin</name>\n"
+            + "  <groupId>org.test</groupId>\n"
+            + "  <artifactId>test-maven-plugin</artifactId>\n"
+            + "  <version>1.0</version>\n"
+            + "  <goalPrefix>test</goalPrefix>\n"
+            + "  <mojos>\n"
+            + "    <mojo>\n"
+            + "      <goal>run</goal>\n"
+            + "      <implementation>org.test.RunMojo</implementation>\n"
+            + "      <language>java</language>\n"
+            + "      <parameters>\n"
+            + "        <parameter>\n"
+            + "          <name>target</name>\n"
+            + "          <type>java.io.File</type>\n"
+            + "          <required>true</required>\n"
+            + "          <editable>true</editable>\n"
+            + "          <description>The target.</description>\n"
+            + "        </parameter>\n"
+            + "      </parameters>\n"
+            + "      <configuration>\n"
+            + "        <target implementation=\"java.io.File\" default-value=\"${project.build.directory}\">"
+            + "${test.target}</target>\n"
+            + "      </configuration>\n"
+            + "    </mojo>\n"
+            + "  </mojos>\n"
+            + "</plugin>\n";
+
+    @TempDir
+    private Path tempDir;
+
+    private final Session session = mock(Session.class);
+
+    private final Project project = mock(Project.class);
+
+    private final ProjectManager projectManager = mock(ProjectManager.class);
+
+    private final Log log = mock(Log.class);
+
+    @BeforeEach
+    void setup() {
+        when(session.getService(ProjectManager.class)).thenReturn(projectManager);
+        when(session.getService(PluginXmlFactory.class)).thenReturn(new DefaultPluginXmlFactory());
+        when(session.getSettings()).thenReturn(Settings.newBuilder().build());
+        when(projectManager.getRemotePluginRepositories(project)).thenReturn(List.of());
+        when(project.getModel()).thenReturn(Model.newBuilder().build());
+    }
+
+    private DescribeMojo newMojo() throws Exception {
+        DescribeMojo mojo = new DescribeMojo();
+        setParentFieldWithReflection(mojo, "session", session);
+        setParentFieldWithReflection(mojo, "project", project);
+        setParentFieldWithReflection(mojo, "log", log);
+        return mojo;
+    }
+
+    /**
+     * Makes the jar of a plugin resolvable by the session.
+     *
+     * @return the coordinates that are resolved
+     */
+    private ArtifactCoordinates resolvablePlugin(String groupId, String artifactId, String version) throws IOException {
+        Path jar = tempDir.resolve(artifactId + "-" + version + ".jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            out.putNextEntry(new JarEntry("META-INF/maven/plugin.xml"));
+            out.write(PLUGIN_XML.getBytes(StandardCharsets.UTF_8));
+            out.closeEntry();
+        }
+        ArtifactCoordinates coordinates = mock(ArtifactCoordinates.class);
+        DownloadedArtifact artifact = mock(DownloadedArtifact.class);
+        when(artifact.getPath()).thenReturn(jar);
+        when(session.createArtifactCoordinates(groupId, artifactId, version, "jar"))
+                .thenReturn(coordinates);
+        when(session.resolveArtifact(eq(coordinates), anyList())).thenReturn(artifact);
+        return coordinates;
+    }
+
     @Test
     void testGetExpressionsRoot()
             throws NoSuchMethodException, SecurityException, IllegalAccessException, IllegalArgumentException,
                     InvocationTargetException {
-        DescribeMojo describeMojo = new DescribeMojo(null, null, null, null, null, null, null);
-        Method toLines =
-                describeMojo.getClass().getDeclaredMethod("toLines", String.class, int.class, int.class, int.class);
+        Method toLines = DescribeMojo.class.getDeclaredMethod("toLines", String.class, int.class, int.class, int.class);
         toLines.setAccessible(true);
         toLines.invoke(null, "", 2, 2, 80);
     }
 
     @Test
+    void testToLinesWrapsLongLines() throws Exception {
+        Method toLines = DescribeMojo.class.getDeclaredMethod("toLines", String.class, int.class, int.class, int.class);
+        toLines.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> lines = (List<String>) toLines.invoke(null, "one two three four", 1, 2, 12);
+
+        assertEquals(List.of("  one two", "  three four"), lines);
+    }
+
+    @Test
     void testValidExpression() throws Exception {
-        StringBuilder sb = new StringBuilder();
-        MojoDescriptor md = new MojoDescriptor();
-        Parameter parameter = new Parameter();
-        parameter.setName("name");
-        parameter.setExpression("${valid.expression}");
-        md.addParameter(parameter);
+        Parameter parameter = Parameter.newBuilder()
+                .name("name")
+                .expression("${valid.expression}")
+                .build();
+        MojoDescriptor md = MojoDescriptor.newBuilder()
+                .goal("goal")
+                .parameters(List.of(parameter))
+                .build();
 
         String ls = System.lineSeparator();
-
-        Method describeMojoParameters = DescribeMojo.class.getDeclaredMethod(
-                "describeMojoParameters", MojoDescriptor.class, StringBuilder.class);
-        describeMojoParameters.setAccessible(true);
-        describeMojoParameters.invoke(new DescribeMojo(null, null, null, null, null, null, null), md, sb);
 
         assertEquals(
                 "  Available parameters:" + ls + ls + "    name" + ls + "      User property: valid.expression" + ls
                         + "      (no description available)" + ls,
-                sb.toString());
+                describeParameters(md));
     }
 
     @Test
     void testInvalidExpression() throws Exception {
-        StringBuilder sb = new StringBuilder();
-        MojoDescriptor md = new MojoDescriptor();
-        Parameter parameter = new Parameter();
-        parameter.setName("name");
-        parameter.setExpression("${project.build.directory}/generated-sources/foobar"); // this is a defaultValue
-        md.addParameter(parameter);
+        // this is a defaultValue
+        Parameter parameter = Parameter.newBuilder()
+                .name("name")
+                .expression("${project.build.directory}/generated-sources/foobar")
+                .build();
+        MojoDescriptor md = MojoDescriptor.newBuilder()
+                .goal("goal")
+                .parameters(List.of(parameter))
+                .build();
 
         String ls = System.lineSeparator();
-
-        Method describeMojoParameters = DescribeMojo.class.getDeclaredMethod(
-                "describeMojoParameters", MojoDescriptor.class, StringBuilder.class);
-        describeMojoParameters.setAccessible(true);
-        describeMojoParameters.invoke(new DescribeMojo(null, null, null, null, null, null, null), md, sb);
 
         assertEquals(
                 "  Available parameters:" + ls + ls
@@ -120,18 +217,54 @@ class DescribeMojoTest {
                         + ls + "      Expression: ${project.build.directory}/generated-sources/foobar"
                         + ls + "      (no description available)"
                         + ls,
-                sb.toString());
+                describeParameters(md));
+    }
+
+    @Test
+    void testMavenThreeDescriptorKeepsDefaultValueAndExpression() throws Exception {
+        resolvablePlugin("org.test", "test-maven-plugin", "1.0");
+        DescribeMojo mojo = newMojo();
+        PluginInfo pi = new PluginInfo();
+        pi.setGroupId("org.test");
+        pi.setArtifactId("test-maven-plugin");
+        pi.setVersion("1.0");
+
+        LoadedPlugin loaded = lookupPluginDescriptor(mojo, pi);
+        MojoDescriptor md = loaded.descriptor.getMojos().get(0);
+        Parameter parameter = md.getParameters().get(0);
+
+        assertEquals("${project.build.directory}", loaded.defaultValue(md, parameter));
+        assertEquals("${test.target}", loaded.expression(md, parameter));
+    }
+
+    private String describeParameters(MojoDescriptor md) throws Exception {
+        Session styled = mock(Session.class);
+        org.apache.maven.api.services.MessageBuilderFactory factory =
+                mock(org.apache.maven.api.services.MessageBuilderFactory.class);
+        when(styled.getService(org.apache.maven.api.services.MessageBuilderFactory.class))
+                .thenReturn(factory);
+        when(factory.builder()).thenAnswer(i -> new PlainMessageBuilder());
+
+        DescribeMojo mojo = new DescribeMojo();
+        setParentFieldWithReflection(mojo, "session", styled);
+
+        StringBuilder sb = new StringBuilder();
+        Method describeMojoParameters = DescribeMojo.class.getDeclaredMethod(
+                "describeMojoParameters", LoadedPlugin.class, MojoDescriptor.class, StringBuilder.class);
+        describeMojoParameters.setAccessible(true);
+        describeMojoParameters.invoke(
+                mojo, new LoadedPlugin(PluginDescriptor.newBuilder().build(), Map.of()), md, sb);
+        return sb.toString();
     }
 
     @Test
     void testParsePluginInfoGAV() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+        DescribeMojo mojo = new DescribeMojo();
         setFieldWithReflection(mojo, "groupId", "org.test");
         setFieldWithReflection(mojo, "artifactId", "test");
         setFieldWithReflection(mojo, "version", "1.0");
 
-        Method parsePluginLookupInfo = setParsePluginLookupInfoAccessibility();
-        PluginInfo pi = (PluginInfo) parsePluginLookupInfo.invoke(mojo);
+        PluginInfo pi = parsePluginLookupInfo(mojo);
 
         assertEquals("org.test", pi.getGroupId());
         assertEquals("test", pi.getArtifactId());
@@ -141,11 +274,10 @@ class DescribeMojoTest {
 
     @Test
     void testParsePluginInfoPluginPrefix() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+        DescribeMojo mojo = new DescribeMojo();
         setFieldWithReflection(mojo, "plugin", "help");
 
-        Method parsePluginLookupInfo = setParsePluginLookupInfoAccessibility();
-        PluginInfo pi = (PluginInfo) parsePluginLookupInfo.invoke(mojo);
+        PluginInfo pi = parsePluginLookupInfo(mojo);
 
         assertNull(pi.getGroupId());
         assertNull(pi.getArtifactId());
@@ -154,18 +286,17 @@ class DescribeMojoTest {
 
         setFieldWithReflection(mojo, "plugin", "help2:::");
 
-        pi = (PluginInfo) parsePluginLookupInfo.invoke(mojo);
+        pi = parsePluginLookupInfo(mojo);
 
         assertEquals("help2", pi.getPrefix());
     }
 
     @Test
     void testParsePluginInfoPluginGA() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+        DescribeMojo mojo = new DescribeMojo();
         setFieldWithReflection(mojo, "plugin", "org.test:test");
 
-        Method parsePluginLookupInfo = setParsePluginLookupInfoAccessibility();
-        PluginInfo pi = (PluginInfo) parsePluginLookupInfo.invoke(mojo);
+        PluginInfo pi = parsePluginLookupInfo(mojo);
 
         assertEquals("org.test", pi.getGroupId());
         assertEquals("test", pi.getArtifactId());
@@ -175,11 +306,10 @@ class DescribeMojoTest {
 
     @Test
     void testParsePluginInfoPluginGAV() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+        DescribeMojo mojo = new DescribeMojo();
         setFieldWithReflection(mojo, "plugin", "org.test:test:1.0");
 
-        Method parsePluginLookupInfo = setParsePluginLookupInfoAccessibility();
-        PluginInfo pi = (PluginInfo) parsePluginLookupInfo.invoke(mojo);
+        PluginInfo pi = parsePluginLookupInfo(mojo);
 
         assertEquals("org.test", pi.getGroupId());
         assertEquals("test", pi.getArtifactId());
@@ -189,218 +319,205 @@ class DescribeMojoTest {
 
     @Test
     void testParsePluginInfoPluginIncorrect() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+        DescribeMojo mojo = new DescribeMojo();
         setFieldWithReflection(mojo, "plugin", "org.test:test:1.0:invalid");
-        try {
-            Method parsePluginLookupInfo = setParsePluginLookupInfoAccessibility();
-            parsePluginLookupInfo.invoke(mojo);
-            fail();
-        } catch (Exception e) {
-            // expected
-        }
+        assertThrows(MojoException.class, () -> parsePluginLookupInfo(mojo));
     }
 
     @Test
-    void testLookupPluginDescriptorPrefixWithVersion() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+    void testProjectNameOfAPomThatMavenCannotBuildIsReadFromTheFile() throws Exception {
+        Path pom = tempDir.resolve("old.pom");
+        Files.write(
+                pom,
+                ("<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>a</artifactId>"
+                                + "<version>2.0</version><name>Old Plugin</name></project>")
+                        .getBytes(StandardCharsets.UTF_8));
+        ProjectBuilder projectBuilder = mock(ProjectBuilder.class);
+        when(projectBuilder.build(any(ProjectBuilderRequest.class))).thenThrow(new MojoException("invalid POM"));
+        when(session.getService(ProjectBuilder.class)).thenReturn(projectBuilder);
+        when(session.getService(ModelXmlFactory.class)).thenReturn(new DefaultModelXmlFactory());
+        DescribeMojo mojo = newMojo();
+
+        Method readProjectName = DescribeMojo.class.getDeclaredMethod("readProjectName", Path.class);
+        readProjectName.setAccessible(true);
+
+        assertEquals("Old Plugin", readProjectName.invoke(mojo, pom));
+    }
+
+    @Test
+    void testGoalPrefix() {
+        assertEquals("help", DescribeMojo.goalPrefix("maven-help-plugin"));
+        assertEquals("exec", DescribeMojo.goalPrefix("exec-maven-plugin"));
+        assertNull(DescribeMojo.goalPrefix("something"));
+    }
+
+    @Test
+    void testLookupPluginDescriptorPrefixOfAProjectPluginWithVersion() throws Throwable {
+        resolvablePlugin("org.test", "test-maven-plugin", "1.0");
+        when(project.getModel())
+                .thenReturn(Model.newBuilder()
+                        .build(Build.newBuilder()
+                                .plugins(List.of(Plugin.newBuilder()
+                                        .groupId("org.test")
+                                        .artifactId("test-maven-plugin")
+                                        .version("0.9")
+                                        .build()))
+                                .build())
+                        .build());
+        DescribeMojo mojo = newMojo();
 
         PluginInfo pi = new PluginInfo();
-        pi.setPrefix("help");
+        pi.setPrefix("test");
         pi.setVersion("1.0");
 
-        Plugin plugin = new Plugin();
-        plugin.setGroupId("org.test");
-        plugin.setArtifactId("test");
+        LoadedPlugin returned = lookupPluginDescriptor(mojo, pi);
 
-        PluginDescriptor pd = new PluginDescriptor();
-
-        MojoDescriptorCreator mojoDescriptorCreator = mock(MojoDescriptorCreator.class);
-        PluginVersionResolver pluginVersionResolver = mock(PluginVersionResolver.class);
-        MavenPluginManager pluginManager = mock(MavenPluginManager.class);
-        MavenSession session = mock(MavenSession.class);
-        when(session.getRepositorySession()).thenReturn(mock(RepositorySystemSession.class));
-        setFieldsOnMojo(mojo, mojoDescriptorCreator, pluginVersionResolver, pluginManager, session);
-        MavenProject mavenProject = new MavenProject();
-        mavenProject.setPluginArtifactRepositories(Collections.emptyList());
-        setParentFieldWithReflection(mojo, "project", mavenProject);
-        when(mojoDescriptorCreator.findPluginForPrefix("help", session)).thenReturn(plugin);
-        when(pluginManager.getPluginDescriptor(any(Plugin.class), anyList(), any()))
-                .thenReturn(pd);
-
-        Method lookupPluginDescriptor = setLookupPluginDescriptorAccessibility();
-        PluginDescriptor returned = (PluginDescriptor) lookupPluginDescriptor.invoke(mojo, pi);
-
-        assertEquals(pd, returned);
-
-        verify(mojoDescriptorCreator).findPluginForPrefix("help", session);
-        verify(pluginVersionResolver, never()).resolve(any(PluginVersionRequest.class));
-        ArgumentCaptor<Plugin> argument = ArgumentCaptor.forClass(Plugin.class);
-        verify(pluginManager).getPluginDescriptor(argument.capture(), anyList(), any());
-        Plugin capturedPlugin = argument.getValue();
-        assertEquals("org.test", capturedPlugin.getGroupId());
-        assertEquals("test", capturedPlugin.getArtifactId());
-        assertEquals("1.0", capturedPlugin.getVersion());
+        assertEquals("org.test:test-maven-plugin:1.0", returned.descriptor.getId());
+        // the version of the parameter wins over the one of the project
+        verify(session, never()).resolveVersionRange(any(), anyList());
     }
 
     @Test
-    void testLookupPluginDescriptorPrefixWithoutVersion() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+    void testLookupPluginDescriptorPrefixOfAProjectPluginWithoutVersion() throws Throwable {
+        resolvablePlugin("org.test", "test-maven-plugin", "2.0");
+        when(project.getModel())
+                .thenReturn(Model.newBuilder()
+                        .build(Build.newBuilder()
+                                .pluginManagement(PluginManagement.newBuilder()
+                                        .plugins(List.of(Plugin.newBuilder()
+                                                .groupId("org.test")
+                                                .artifactId("test-maven-plugin")
+                                                .version("2.0")
+                                                .build()))
+                                        .build())
+                                .build())
+                        .build());
+        DescribeMojo mojo = newMojo();
 
         PluginInfo pi = new PluginInfo();
-        pi.setPrefix("help");
+        pi.setPrefix("test");
 
-        Plugin plugin = new Plugin();
-        plugin.setGroupId("org.test");
-        plugin.setArtifactId("test");
+        LoadedPlugin returned = lookupPluginDescriptor(mojo, pi);
 
-        PluginDescriptor pd = new PluginDescriptor();
-
-        MojoDescriptorCreator mojoDescriptorCreator = mock(MojoDescriptorCreator.class);
-        PluginVersionResolver pluginVersionResolver = mock(PluginVersionResolver.class);
-        MavenPluginManager pluginManager = mock(MavenPluginManager.class);
-        PluginVersionResult versionResult = mock(PluginVersionResult.class);
-        MavenSession session = mock(MavenSession.class);
-        when(session.getRepositorySession()).thenReturn(mock(RepositorySystemSession.class));
-        setFieldsOnMojo(mojo, mojoDescriptorCreator, pluginVersionResolver, pluginManager, session);
-        MavenProject mavenProject = new MavenProject();
-        mavenProject.setPluginArtifactRepositories(Collections.emptyList());
-        setParentFieldWithReflection(mojo, "project", mavenProject);
-        when(mojoDescriptorCreator.findPluginForPrefix("help", session)).thenReturn(plugin);
-        when(pluginVersionResolver.resolve(any(PluginVersionRequest.class))).thenReturn(versionResult);
-        when(versionResult.getVersion()).thenReturn("1.0");
-        when(pluginManager.getPluginDescriptor(any(Plugin.class), anyList(), any()))
-                .thenReturn(pd);
-
-        Method lookupPluginDescriptor = setLookupPluginDescriptorAccessibility();
-        PluginDescriptor returned = (PluginDescriptor) lookupPluginDescriptor.invoke(mojo, pi);
-        assertEquals(pd, returned);
-
-        verify(mojoDescriptorCreator).findPluginForPrefix("help", session);
-        ArgumentCaptor<PluginVersionRequest> versionArgument = ArgumentCaptor.forClass(PluginVersionRequest.class);
-        verify(pluginVersionResolver).resolve(versionArgument.capture());
-        assertEquals("org.test", versionArgument.getValue().getGroupId());
-        assertEquals("test", versionArgument.getValue().getArtifactId());
-        ArgumentCaptor<Plugin> argument = ArgumentCaptor.forClass(Plugin.class);
-        verify(pluginManager).getPluginDescriptor(argument.capture(), anyList(), any());
-        Plugin capturedPlugin = argument.getValue();
-        assertEquals("org.test", capturedPlugin.getGroupId());
-        assertEquals("test", capturedPlugin.getArtifactId());
-        assertEquals("1.0", capturedPlugin.getVersion());
+        assertEquals("org.test", returned.descriptor.getGroupId());
+        assertEquals("test", returned.descriptor.getGoalPrefix());
     }
 
     @Test
     void testLookupPluginDescriptorGAV() throws Throwable {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
+        resolvablePlugin("org.test", "test-maven-plugin", "1.0");
+        DescribeMojo mojo = newMojo();
 
         PluginInfo pi = new PluginInfo();
         pi.setGroupId("org.test");
-        pi.setArtifactId("test");
+        pi.setArtifactId("test-maven-plugin");
         pi.setVersion("1.0");
 
-        PluginDescriptor pd = new PluginDescriptor();
+        LoadedPlugin returned = lookupPluginDescriptor(mojo, pi);
 
-        MojoDescriptorCreator mojoDescriptorCreator = mock(MojoDescriptorCreator.class);
-        PluginVersionResolver pluginVersionResolver = mock(PluginVersionResolver.class);
-        MavenPluginManager pluginManager = mock(MavenPluginManager.class);
-        MavenSession session = mock(MavenSession.class);
-        when(session.getRepositorySession()).thenReturn(mock(RepositorySystemSession.class));
-        setFieldsOnMojo(mojo, mojoDescriptorCreator, pluginVersionResolver, pluginManager, session);
-        MavenProject mavenProject = new MavenProject();
-        mavenProject.setPluginArtifactRepositories(Collections.emptyList());
-        setParentFieldWithReflection(mojo, "project", mavenProject);
-        when(pluginManager.getPluginDescriptor(any(Plugin.class), anyList(), any()))
-                .thenReturn(pd);
+        assertEquals("Test Plugin", returned.descriptor.getName());
+        assertEquals("run", returned.descriptor.getMojos().get(0).getGoal());
+        verify(session, never()).resolveVersionRange(any(), anyList());
+    }
 
-        Method lookupPluginDescriptor = setLookupPluginDescriptorAccessibility();
-        PluginDescriptor returned = (PluginDescriptor) lookupPluginDescriptor.invoke(mojo, pi);
+    @Test
+    void testLookupPluginDescriptorPrefixNotFound() throws Throwable {
+        when(session.createArtifactCoordinates(any(), any(), any(), any())).thenReturn(mock(ArtifactCoordinates.class));
+        when(session.resolveVersionRange(any(), anyList())).thenThrow(new MojoException("not found"));
+        DescribeMojo mojo = newMojo();
 
-        assertEquals(pd, returned);
+        PluginInfo pi = new PluginInfo();
+        pi.setPrefix("nothing");
 
-        verify(mojoDescriptorCreator, never()).findPluginForPrefix(any(String.class), any(MavenSession.class));
-        verify(pluginVersionResolver, never()).resolve(any(PluginVersionRequest.class));
-        ArgumentCaptor<Plugin> argument = ArgumentCaptor.forClass(Plugin.class);
-        verify(pluginManager).getPluginDescriptor(argument.capture(), anyList(), any());
-        Plugin capturedPlugin = argument.getValue();
-        assertEquals("org.test", capturedPlugin.getGroupId());
-        assertEquals("test", capturedPlugin.getArtifactId());
-        assertEquals("1.0", capturedPlugin.getVersion());
+        MojoException e = assertThrows(MojoException.class, () -> lookupPluginDescriptor(mojo, pi));
+        assertTrue(e.getMessage().contains("nothing"), e.getMessage());
     }
 
     @Test
     void testLookupPluginDescriptorGMissingA() {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
         PluginInfo pi = new PluginInfo();
         pi.setGroupId("org.test");
         try {
-            Method lookupPluginDescriptor = setLookupPluginDescriptorAccessibility();
-            lookupPluginDescriptor.invoke(mojo, pi);
+            lookupPluginDescriptor(newMojo(), pi);
             fail();
-        } catch (InvocationTargetException e) {
-            assertTrue(e.getTargetException().getMessage().startsWith("You must specify either"));
-        } catch (NoSuchMethodException | IllegalAccessException e) {
-            fail();
+        } catch (MojoException e) {
+            assertTrue(e.getMessage().startsWith("You must specify either"));
+        } catch (Exception e) {
+            fail(e);
         }
     }
 
     @Test
     void testLookupPluginDescriptorAMissingG() {
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, null, null);
         PluginInfo pi = new PluginInfo();
         pi.setArtifactId("test");
         try {
-            Method lookupPluginDescriptor = setLookupPluginDescriptorAccessibility();
-            lookupPluginDescriptor.invoke(mojo, pi);
+            lookupPluginDescriptor(newMojo(), pi);
             fail();
-        } catch (InvocationTargetException e) {
-            assertTrue(e.getTargetException().getMessage().startsWith("You must specify either"));
+        } catch (MojoException e) {
+            assertTrue(e.getMessage().startsWith("You must specify either"));
         } catch (Exception e) {
-            fail(e.getMessage());
+            fail(e);
         }
     }
 
+    private Lifecycle lifecycle(String id, Map<String, List<Plugin>> bindings, String... phases) {
+        Lifecycle lifecycle = mock(Lifecycle.class);
+        when(lifecycle.id()).thenReturn(id);
+        List<Lifecycle.Phase> phaseMocks = new java.util.ArrayList<>();
+        for (String phase : phases) {
+            Lifecycle.Phase p = mock(Lifecycle.Phase.class);
+            when(p.name()).thenReturn(phase);
+            when(p.plugins()).thenReturn(bindings.getOrDefault(phase, List.of()));
+            phaseMocks.add(p);
+        }
+        when(lifecycle.allPhases()).thenAnswer(i -> phaseMocks.stream());
+        return lifecycle;
+    }
+
+    private void registry(Lifecycle lifecycle, String... phases) {
+        LifecycleRegistry registry = mock(LifecycleRegistry.class);
+        when(registry.iterator()).thenAnswer(i -> List.of(lifecycle).iterator());
+        when(registry.computePhases(lifecycle)).thenReturn(List.of(phases));
+        when(session.getService(LifecycleRegistry.class)).thenReturn(registry);
+    }
+
+    private static Plugin plugin(String artifactId, String version, String phase, String goal) {
+        return Plugin.newBuilder()
+                .groupId("org.apache.maven.plugins")
+                .artifactId(artifactId)
+                .version(version)
+                .executions(List.of(PluginExecution.newBuilder()
+                        .phase(phase)
+                        .goals(List.of(goal))
+                        .build()))
+                .build();
+    }
+
     /**
-     * Regression test for Maven 3.10.0 behavior where {@code Lifecycle.getDefaultLifecyclePhases()}
-     * returns an empty map (not null) for the "default" lifecycle.
-     * The mojo must fall through to the packaging-specific lifecycle mapping in that case.
+     * The "default" lifecycle has no binding of its own: the mojo must use the bindings of the packaging.
      */
     @Test
     void testDescribeCommandPackagingSpecificPhaseShowsBindings() throws Exception {
-        // default lifecycle: built-in phases are empty (3.10.0 behavior)
-        Lifecycle lifecycle = mock(Lifecycle.class);
-        when(lifecycle.getId()).thenReturn("default");
-        when(lifecycle.getPhases()).thenReturn(Arrays.asList("validate", "compile", "test", "package"));
-        when(lifecycle.getDefaultLifecyclePhases()).thenReturn(Collections.emptyMap());
-
-        Map<String, Lifecycle> phaseMap = new HashMap<>();
-        for (String p : Arrays.asList("validate", "compile", "test", "package")) {
-            phaseMap.put(p, lifecycle);
-        }
-        DefaultLifecycles defaultLifecycles = mock(DefaultLifecycles.class);
-        when(defaultLifecycles.getPhaseToLifecycleMap()).thenReturn(phaseMap);
+        Lifecycle lifecycle = lifecycle("default", Map.of(), "validate", "compile", "test", "package");
+        registry(lifecycle, "validate", "compile", "test", "package");
 
         // packaging-specific bindings: only "compile" phase is bound
-        Map<String, LifecyclePhase> lifecyclePhases = new LinkedHashMap<>();
-        lifecyclePhases.put(
-                "compile", new LifecyclePhase("org.apache.maven.plugins:maven-compiler-plugin:3.11.0:compile"));
-        org.apache.maven.lifecycle.mapping.Lifecycle mappingLifecycle =
-                new org.apache.maven.lifecycle.mapping.Lifecycle();
-        mappingLifecycle.setLifecyclePhases(lifecyclePhases);
+        Packaging packaging = mock(Packaging.class);
+        when(packaging.id()).thenReturn("jar");
+        when(packaging.plugins())
+                .thenReturn(Map.of(
+                        "default",
+                        PluginContainer.newBuilder()
+                                .plugins(List.of(plugin("maven-compiler-plugin", "3.11.0", "compile", "compile")))
+                                .build()));
+        when(project.getPackaging()).thenReturn(packaging);
 
-        LifecycleMapping lifecycleMapping = mock(LifecycleMapping.class);
-        when(lifecycleMapping.getLifecycles()).thenReturn(Collections.singletonMap("default", mappingLifecycle));
-
-        MavenProject project = mock(MavenProject.class);
-        when(project.getPackaging()).thenReturn("jar");
-
-        DescribeMojo mojo = new DescribeMojo(
-                null, null, null, null, null, defaultLifecycles, Collections.singletonMap("jar", lifecycleMapping));
+        DescribeMojo mojo = newMojo();
         setFieldWithReflection(mojo, "cmd", "compile");
-        setParentFieldWithReflection(mojo, "project", project);
 
         StringBuilder sb = new StringBuilder();
-        Method describeCommand = DescribeMojo.class.getDeclaredMethod("describeCommand", StringBuilder.class);
-        describeCommand.setAccessible(true);
-        boolean result = (boolean) describeCommand.invoke(mojo, sb);
+        boolean result = describeCommand(mojo, sb);
 
         String output = sb.toString();
         assertFalse(result);
@@ -411,40 +528,24 @@ class DescribeMojoTest {
     }
 
     /**
-     * Built-in lifecycle (e.g. "clean") has non-empty {@code getDefaultLifecyclePhases()} —
-     * the mojo should use those directly without consulting lifecycle mappings.
+     * Built-in lifecycle (e.g. "clean") has bindings of its own: the mojo should use those directly without
+     * consulting the packaging.
      */
     @Test
     void testDescribeCommandBuiltinLifecyclePhaseShowsBindings() throws Exception {
-        Map<String, LifecyclePhase> builtinPhases = new LinkedHashMap<>();
-        builtinPhases.put("pre-clean", null);
-        builtinPhases.put("clean", new LifecyclePhase("org.apache.maven.plugins:maven-clean-plugin:3.2.0:clean"));
-        builtinPhases.put("post-clean", null);
+        Lifecycle lifecycle = lifecycle(
+                "clean",
+                Map.of("clean", List.of(plugin("maven-clean-plugin", "3.2.0", "clean", "clean"))),
+                "pre-clean",
+                "clean",
+                "post-clean");
+        registry(lifecycle, "pre-clean", "clean", "post-clean");
 
-        Lifecycle lifecycle = mock(Lifecycle.class);
-        when(lifecycle.getId()).thenReturn("clean");
-        when(lifecycle.getPhases()).thenReturn(Arrays.asList("pre-clean", "clean", "post-clean"));
-        when(lifecycle.getDefaultLifecyclePhases()).thenReturn(builtinPhases);
-
-        Map<String, Lifecycle> phaseMap = new HashMap<>();
-        for (String p : Arrays.asList("pre-clean", "clean", "post-clean")) {
-            phaseMap.put(p, lifecycle);
-        }
-        DefaultLifecycles defaultLifecycles = mock(DefaultLifecycles.class);
-        when(defaultLifecycles.getPhaseToLifecycleMap()).thenReturn(phaseMap);
-
-        MavenProject project = mock(MavenProject.class);
-        when(project.getPackaging()).thenReturn("jar");
-
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, defaultLifecycles, Collections.emptyMap());
+        DescribeMojo mojo = newMojo();
         setFieldWithReflection(mojo, "cmd", "clean");
-        setFieldWithReflection(mojo, "lifecycleMappings", Collections.emptyMap());
-        setParentFieldWithReflection(mojo, "project", project);
 
         StringBuilder sb = new StringBuilder();
-        Method describeCommand = DescribeMojo.class.getDeclaredMethod("describeCommand", StringBuilder.class);
-        describeCommand.setAccessible(true);
-        boolean result = (boolean) describeCommand.invoke(mojo, sb);
+        boolean result = describeCommand(mojo, sb);
 
         String output = sb.toString();
         assertFalse(result);
@@ -455,24 +556,95 @@ class DescribeMojoTest {
     }
 
     @Test
+    void testDescribeCommandAcceptsTheMavenThreeNameOfAPhase() throws Exception {
+        Lifecycle lifecycle = lifecycle("default", Map.of(), "validate", "after:resources", "compile");
+        Lifecycle.Alias alias = mock(Lifecycle.Alias.class);
+        when(alias.v3Phase()).thenReturn("process-resources");
+        when(alias.v4Phase()).thenReturn("after:resources");
+        when(lifecycle.aliases()).thenReturn(List.of(alias));
+        registry(lifecycle, "validate", "after:resources", "compile");
+
+        Packaging packaging = mock(Packaging.class);
+        when(packaging.id()).thenReturn("jar");
+        when(packaging.plugins())
+                .thenReturn(Map.of(
+                        "default",
+                        PluginContainer.newBuilder()
+                                .plugins(List.of(
+                                        plugin("maven-resources-plugin", "3.5.0", "process-resources", "resources")))
+                                .build()));
+        when(project.getPackaging()).thenReturn(packaging);
+
+        DescribeMojo mojo = newMojo();
+        setFieldWithReflection(mojo, "cmd", "process-resources");
+
+        StringBuilder sb = new StringBuilder();
+        describeCommand(mojo, sb);
+
+        String output = sb.toString();
+        assertTrue(output.contains("'process-resources' is a phase corresponding to this plugin:"), output);
+        assertTrue(output.contains("org.apache.maven.plugins:maven-resources-plugin:3.5.0:resources"), output);
+        assertTrue(output.contains("* after:resources: org.apache.maven.plugins:maven-resources-plugin"), output);
+    }
+
+    @Test
     void testDescribeCommandUnknownPhaseThrows() throws Exception {
-        DefaultLifecycles defaultLifecycles = mock(DefaultLifecycles.class);
-        when(defaultLifecycles.getPhaseToLifecycleMap()).thenReturn(Collections.emptyMap());
+        Lifecycle lifecycle = lifecycle("default", Map.of(), "validate");
+        registry(lifecycle, "validate");
 
-        DescribeMojo mojo = new DescribeMojo(null, null, null, null, null, defaultLifecycles, Collections.emptyMap());
+        DescribeMojo mojo = newMojo();
         setFieldWithReflection(mojo, "cmd", "nonexistent-phase");
-        setParentFieldWithReflection(mojo, "project", mock(MavenProject.class));
 
+        MojoException e = assertThrows(MojoException.class, () -> describeCommand(mojo, new StringBuilder()));
+        assertTrue(e.getMessage().contains("nonexistent-phase"));
+    }
+
+    @Test
+    void testDescribeCommandGoalSetsThePluginAndTheGoal() throws Exception {
+        DescribeMojo mojo = newMojo();
+        setFieldWithReflection(mojo, "cmd", "org.test:test-maven-plugin:1.0:run");
+
+        StringBuilder sb = new StringBuilder();
+        boolean result = describeCommand(mojo, sb);
+
+        assertTrue(result);
+        assertTrue(sb.toString().contains("is a plugin goal (aka mojo)"));
+        assertEquals("org.test:test-maven-plugin:1.0", getFieldWithReflection(mojo, "plugin"));
+        assertEquals("run", getFieldWithReflection(mojo, "goal"));
+
+        setFieldWithReflection(mojo, "cmd", "test:run");
+        describeCommand(mojo, new StringBuilder());
+        assertEquals("test", getFieldWithReflection(mojo, "plugin"));
+    }
+
+    private static boolean describeCommand(DescribeMojo mojo, StringBuilder sb) throws Exception {
         Method describeCommand = DescribeMojo.class.getDeclaredMethod("describeCommand", StringBuilder.class);
         describeCommand.setAccessible(true);
         try {
-            describeCommand.invoke(mojo, new StringBuilder());
-            fail("Expected MojoExecutionException");
+            return (boolean) describeCommand.invoke(mojo, sb);
         } catch (InvocationTargetException e) {
-            assertTrue(
-                    e.getTargetException() instanceof MojoExecutionException,
-                    "Expected MojoExecutionException, got: " + e.getTargetException());
-            assertTrue(e.getTargetException().getMessage().contains("nonexistent-phase"));
+            throw (Exception) e.getTargetException();
+        }
+    }
+
+    private static LoadedPlugin lookupPluginDescriptor(DescribeMojo mojo, PluginInfo pi) throws Exception {
+        Method lookupPluginDescriptor =
+                DescribeMojo.class.getDeclaredMethod("lookupPluginDescriptor", PluginInfo.class);
+        lookupPluginDescriptor.setAccessible(true);
+        try {
+            return (LoadedPlugin) lookupPluginDescriptor.invoke(mojo, pi);
+        } catch (InvocationTargetException e) {
+            throw (Exception) e.getTargetException();
+        }
+    }
+
+    private static PluginInfo parsePluginLookupInfo(DescribeMojo mojo) throws Exception {
+        Method parsePluginLookupInfo = DescribeMojo.class.getDeclaredMethod("parsePluginLookupInfo");
+        parsePluginLookupInfo.setAccessible(true);
+        try {
+            return (PluginInfo) parsePluginLookupInfo.invoke(mojo);
+        } catch (InvocationTargetException e) {
+            throw (Exception) e.getTargetException();
         }
     }
 
@@ -482,7 +654,6 @@ class DescribeMojoTest {
         final Field field = mojo.getClass().getSuperclass().getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(mojo, value);
-        field.setAccessible(false);
     }
 
     private static void setFieldWithReflection(final Object mojo, final String fieldName, final Object value)
@@ -490,32 +661,56 @@ class DescribeMojoTest {
         final Field field = mojo.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(mojo, value);
-        field.setAccessible(false);
     }
 
-    private static void setFieldsOnMojo(
-            final DescribeMojo mojo,
-            final MojoDescriptorCreator mojoDescriptorCreator,
-            final PluginVersionResolver pluginVersionResolver,
-            final MavenPluginManager pluginManager,
-            final MavenSession session)
+    private static Object getFieldWithReflection(final Object mojo, final String fieldName)
             throws NoSuchFieldException, IllegalAccessException {
-        setFieldWithReflection(mojo, "mojoDescriptorCreator", mojoDescriptorCreator);
-        setFieldWithReflection(mojo, "pluginVersionResolver", pluginVersionResolver);
-        setFieldWithReflection(mojo, "pluginManager", pluginManager);
-        setParentFieldWithReflection(mojo, "session", session);
+        final Field field = mojo.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(mojo);
     }
 
-    private static Method setLookupPluginDescriptorAccessibility() throws NoSuchMethodException {
-        Method lookupPluginDescriptor =
-                DescribeMojo.class.getDeclaredMethod("lookupPluginDescriptor", PluginInfo.class);
-        lookupPluginDescriptor.setAccessible(true);
-        return lookupPluginDescriptor;
-    }
+    /** A message builder without styles. */
+    static final class PlainMessageBuilder implements org.apache.maven.api.services.MessageBuilder {
+        private final StringBuilder sb = new StringBuilder();
 
-    private static Method setParsePluginLookupInfoAccessibility() throws NoSuchMethodException {
-        Method parsePluginLookupInfo = DescribeMojo.class.getDeclaredMethod("parsePluginLookupInfo");
-        parsePluginLookupInfo.setAccessible(true);
-        return parsePluginLookupInfo;
+        @Override
+        public org.apache.maven.api.services.MessageBuilder style(String style) {
+            return this;
+        }
+
+        @Override
+        public org.apache.maven.api.services.MessageBuilder resetStyle() {
+            return this;
+        }
+
+        @Override
+        public org.apache.maven.api.services.MessageBuilder append(CharSequence s) {
+            sb.append(s);
+            return this;
+        }
+
+        @Override
+        public org.apache.maven.api.services.MessageBuilder append(CharSequence s, int start, int end) {
+            sb.append(s, start, end);
+            return this;
+        }
+
+        @Override
+        public org.apache.maven.api.services.MessageBuilder append(char c) {
+            sb.append(c);
+            return this;
+        }
+
+        @Override
+        public org.apache.maven.api.services.MessageBuilder setLength(int length) {
+            sb.setLength(length);
+            return this;
+        }
+
+        @Override
+        public String build() {
+            return sb.toString();
+        }
     }
 }

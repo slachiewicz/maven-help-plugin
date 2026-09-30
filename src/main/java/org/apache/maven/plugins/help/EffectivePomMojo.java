@@ -18,32 +18,26 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
 import java.io.StringWriter;
-import java.util.Collections;
 import java.util.List;
-import java.util.Properties;
+import java.util.TreeMap;
 
-import org.apache.maven.model.InputLocation;
-import org.apache.maven.model.InputSource;
-import org.apache.maven.model.Model;
-import org.apache.maven.model.io.xpp3.MavenXpp3Writer;
-import org.apache.maven.model.io.xpp3.MavenXpp3WriterEx;
-import org.apache.maven.plugin.MojoExecution;
-import org.apache.maven.plugin.MojoExecution.Source;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.project.ProjectBuilder;
-import org.apache.maven.shared.utils.logging.MessageUtils;
-import org.codehaus.plexus.util.StringUtils;
+import org.apache.maven.api.MojoExecution;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.di.Inject;
+import org.apache.maven.api.model.InputLocation;
+import org.apache.maven.api.model.InputSource;
+import org.apache.maven.api.model.Model;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.plugin.annotations.Parameter;
+import org.apache.maven.api.services.MessageBuilderFactory;
+import org.apache.maven.api.services.xml.ModelXmlFactory;
+import org.apache.maven.api.services.xml.XmlWriterRequest;
 import org.codehaus.plexus.util.xml.PrettyPrintXMLWriter;
 import org.codehaus.plexus.util.xml.XMLWriter;
 import org.codehaus.plexus.util.xml.XmlWriterUtil;
-import org.eclipse.aether.RepositorySystem;
 
 /**
  * Displays the effective POM as an XML for this build, with the active profiles factored in, or a specified artifact.
@@ -58,16 +52,9 @@ public class EffectivePomMojo extends AbstractEffectiveMojo {
     // ----------------------------------------------------------------------
 
     /**
-     * The projects in the current build. The effective-POM for
-     * each of these projects will written.
-     */
-    @Parameter(defaultValue = "${reactorProjects}", required = true, readonly = true)
-    private List<MavenProject> projects;
-
-    /**
      * This mojo execution, used to determine if it was launched from the lifecycle or the command-line.
      */
-    @Parameter(defaultValue = "${mojo}", required = true, readonly = true)
+    @Inject
     private MojoExecution mojoExecution;
 
     /**
@@ -89,34 +76,31 @@ public class EffectivePomMojo extends AbstractEffectiveMojo {
     @Parameter(property = "verbose", defaultValue = "false")
     private boolean verbose = false;
 
-    @Inject
-    public EffectivePomMojo(ProjectBuilder projectBuilder, RepositorySystem repositorySystem) {
-        super(projectBuilder, repositorySystem);
-    }
-
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
     /** {@inheritDoc} */
     @Override
-    public void execute() throws MojoExecutionException {
+    public void execute() throws MojoException {
+        List<Project> projects = session.getProjects();
+        Project project = this.project;
         if (artifact != null && !artifact.isEmpty()) {
             project = getMavenProject(artifact);
-            projects = Collections.singletonList(project);
+            projects = List.of(project);
         }
 
         StringWriter w = new StringWriter();
         String encoding = output != null ? project.getModel().getModelEncoding() : System.getProperty("file.encoding");
-        XMLWriter writer = new PrettyPrintXMLWriter(
-                w, StringUtils.repeat(" ", XmlWriterUtil.DEFAULT_INDENTATION_SIZE), encoding, null);
+        XMLWriter writer =
+                new PrettyPrintXMLWriter(w, " ".repeat(XmlWriterUtil.DEFAULT_INDENTATION_SIZE), encoding, null);
 
         writeHeader(writer);
 
-        if (shouldWriteAllEffectivePOMsInReactor()) {
+        if (shouldWriteAllEffectivePOMsInReactor(projects, project)) {
             // outer root element
             writer.startElement("projects");
-            for (MavenProject subProject : projects) {
+            for (Project subProject : projects) {
                 writeEffectivePom(subProject, writer);
             }
             writer.endElement();
@@ -134,21 +118,23 @@ public class EffectivePomMojo extends AbstractEffectiveMojo {
             try {
                 writeXmlFile(output, effectivePom);
             } catch (IOException e) {
-                throw new MojoExecutionException("Cannot write effective-POM to output: " + output, e);
+                throw new MojoException("Cannot write effective-POM to output: " + output, e);
             }
 
-            getLog().info("Effective-POM written to: " + output);
+            log.info("Effective-POM written to: " + output);
         } else {
-            if (MessageUtils.isColorEnabled()) {
+            MessageBuilderFactory messageBuilderFactory = session.getService(MessageBuilderFactory.class);
+            if (messageBuilderFactory.isColorEnabled()) {
                 // add color to comments
-                String comment = MessageUtils.buffer().project("<!--.-->").build();
+                String comment =
+                        messageBuilderFactory.builder().project("<!--.-->").build();
                 int dotIndex = comment.indexOf(".");
                 String commentStart = comment.substring(0, dotIndex);
                 String commentEnd = comment.substring(dotIndex + 1);
                 effectivePom = effectivePom.replace("<!--", commentStart).replace("-->", commentEnd);
             }
 
-            getLog().info(LS + "Effective POMs, after inheritance, interpolation, and profiles are applied:" + LS + LS
+            log.info(LS + "Effective POMs, after inheritance, interpolation, and profiles are applied:" + LS + LS
                     + effectivePom + LS);
         }
     }
@@ -160,10 +146,10 @@ public class EffectivePomMojo extends AbstractEffectiveMojo {
      *
      * @return <code>true</code> if all effective POMs should be written, <code>false</code> otherwise.
      */
-    private boolean shouldWriteAllEffectivePOMsInReactor() {
-        Source source = mojoExecution.getSource();
-        // [MNG-5550] For Maven < 3.2.1, the source is null, instead of LIFECYCLE: only rely on comparisons with CLI
-        return projects.size() > 1 && (source == Source.CLI || projects.get(0).equals(project));
+    private boolean shouldWriteAllEffectivePOMsInReactor(List<Project> projects, Project project) {
+        // a goal invoked from the command-line is not bound to a lifecycle phase
+        boolean cli = mojoExecution.getLifecyclePhase() == null;
+        return projects.size() > 1 && (cli || projects.get(0).equals(project));
     }
 
     // ----------------------------------------------------------------------
@@ -175,26 +161,24 @@ public class EffectivePomMojo extends AbstractEffectiveMojo {
      *
      * @param project the project of the current build, not null.
      * @param writer the XML writer , not null, not null.
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private void writeEffectivePom(MavenProject project, XMLWriter writer) throws MojoExecutionException {
-        Model pom = project.getModel();
-        cleanModel(pom);
+    private void writeEffectivePom(Project project, XMLWriter writer) throws MojoException {
+        Model pom = cleanModel(project.getModel());
 
         StringWriter sWriter = new StringWriter();
         try {
+            XmlWriterRequest.XmlWriterRequestBuilder<Model> request =
+                    XmlWriterRequest.<Model>builder().writer(sWriter).content(pom);
             if (verbose) {
-                MavenXpp3WriterEx mavenXpp3WriterEx = new MavenXpp3WriterEx();
-                mavenXpp3WriterEx.setStringFormatter(new InputLocationStringFormatter());
-                mavenXpp3WriterEx.write(sWriter, pom);
-            } else {
-                new MavenXpp3Writer().write(sWriter, pom);
+                request.inputLocationFormatter(EffectivePomMojo::formatInputLocation);
             }
-        } catch (IOException e) {
-            throw new MojoExecutionException("Cannot serialize POM to XML.", e);
+            session.getService(ModelXmlFactory.class).write(request.build());
+        } catch (RuntimeException e) {
+            throw new MojoException("Cannot serialize POM to XML.", e);
         }
 
-        // This removes the XML declaration written by MavenXpp3Writer
+        // This removes the XML declaration written by the model writer
         String effectivePom = prettyFormat(sWriter.toString(), null, true);
 
         writeComment(writer, "Effective POM for project '" + project.getId() + "'");
@@ -206,26 +190,25 @@ public class EffectivePomMojo extends AbstractEffectiveMojo {
      * Apply some logic to clean the model before writing it.
      *
      * @param pom not null
+     * @return the model to write
      */
-    private static void cleanModel(Model pom) {
-        Properties properties = new SortedProperties();
-        properties.putAll(pom.getProperties());
-        pom.setProperties(properties);
+    private static Model cleanModel(Model pom) {
+        return Model.newBuilder(pom, true)
+                .properties(new TreeMap<>(pom.getProperties()))
+                .build();
     }
 
-    private static class InputLocationStringFormatter extends InputLocation.StringFormatter {
-        @Override
-        public String toString(InputLocation location) {
-            InputSource source = location.getSource();
+    private static String formatInputLocation(Object object) {
+        InputLocation location = (InputLocation) object;
+        InputSource source = location.getSource();
 
-            String s = source.getModelId(); // by default, display modelId
+        String s = source.getModelId(); // by default, display modelId
 
-            if (StringUtils.isBlank(s) || s.contains("[unknown-version]")) {
-                // unless it is blank or does not provide version information
-                s = source.toString();
-            }
-
-            return '}' + s + ((location.getLineNumber() >= 0) ? ", line " + location.getLineNumber() : "") + ' ';
+        if (s == null || s.isBlank() || s.contains("[unknown-version]")) {
+            // unless it is blank or does not provide version information
+            s = source.toString();
         }
+
+        return '}' + s + ((location.getLineNumber() >= 0) ? ", line " + location.getLineNumber() : "") + ' ';
     }
 }
