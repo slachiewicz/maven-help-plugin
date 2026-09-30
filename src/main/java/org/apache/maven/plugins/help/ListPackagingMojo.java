@@ -18,89 +18,71 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
-import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 
-import org.apache.maven.lifecycle.DefaultLifecycles;
-import org.apache.maven.lifecycle.mapping.Lifecycle;
-import org.apache.maven.lifecycle.mapping.LifecycleMapping;
-import org.apache.maven.lifecycle.mapping.LifecycleMojo;
-import org.apache.maven.lifecycle.mapping.LifecyclePhase;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.project.ProjectBuilder;
-import org.eclipse.aether.RepositorySystem;
+import org.apache.maven.api.Lifecycle;
+import org.apache.maven.api.Packaging;
+import org.apache.maven.api.model.Plugin;
+import org.apache.maven.api.model.PluginContainer;
+import org.apache.maven.api.model.PluginExecution;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.services.LifecycleRegistry;
+import org.apache.maven.api.services.PackagingRegistry;
 
 /**
  * Displays the list of packaging that are supported by Maven.
  *
  * @since 3.5.2
  */
-@Mojo(name = "list-packaging", requiresProject = false, aggregator = true)
+@Mojo(name = "list-packaging", projectRequired = false, aggregator = true)
 public class ListPackagingMojo extends AbstractHelpMojo {
-    /**
-     * The Maven default built-in lifecycles.
-     */
-    private final DefaultLifecycles defaultLifecycles;
 
     /**
-     * The Maven default built-in lifecycles.
+     * The packagings Maven itself defines. The Maven 4 API can look a packaging up by its id only, it cannot list
+     * the registered ones, so these ids are probed.
      */
-    private final Map<String, LifecycleMapping> lifecycleMapping;
-
-    @Inject
-    public ListPackagingMojo(
-            ProjectBuilder projectBuilder,
-            RepositorySystem repositorySystem,
-            DefaultLifecycles defaultLifecycles,
-            Map<String, LifecycleMapping> lifecycleMapping) {
-        super(projectBuilder, repositorySystem);
-        this.defaultLifecycles = defaultLifecycles;
-        this.lifecycleMapping = lifecycleMapping;
-    }
-
-    // ----------------------------------------------------------------------
-    // Mojo parameters
-    // ----------------------------------------------------------------------
+    static final List<String> KNOWN_PACKAGINGS =
+            List.of("pom", "jar", "maven-plugin", "ejb", "ejb3", "war", "ear", "rar");
 
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
-    /**
-     * {@inheritDoc}
-     */
     @Override
-    public void execute() throws MojoExecutionException, MojoFailureException {
+    public void execute() throws MojoException {
         try {
+            LifecycleRegistry lifecycleRegistry = session.getService(LifecycleRegistry.class);
+            PackagingRegistry packagingRegistry = session.getService(PackagingRegistry.class);
+
+            Map<String, Packaging> packagings = new TreeMap<>();
+            for (String id : KNOWN_PACKAGINGS) {
+                packagingRegistry.lookup(id).ifPresent(p -> packagings.put(id, p));
+            }
+
             StringBuilder descriptionBuffer = new StringBuilder();
-            for (Map.Entry<String, LifecycleMapping> lifecycleMappingEntry :
-                    new TreeMap<>(lifecycleMapping).entrySet()) {
-                LifecycleMapping lifecycleMapping = lifecycleMappingEntry.getValue();
-                for (Map.Entry<String, Lifecycle> phaseEntry :
-                        lifecycleMapping.getLifecycles().entrySet()) {
-                    Lifecycle mapping = phaseEntry.getValue();
+            for (Map.Entry<String, Packaging> packagingEntry : packagings.entrySet()) {
+                for (Map.Entry<String, PluginContainer> lifecycleEntry :
+                        new TreeMap<>(packagingEntry.getValue().plugins()).entrySet()) {
                     descriptionBuffer
-                            .append(lifecycleMappingEntry.getKey())
+                            .append(packagingEntry.getKey())
                             .append(" (lifecycle: ")
-                            .append(mapping.getId())
+                            .append(lifecycleEntry.getKey())
                             .append(")")
                             .append(LS);
-                    org.apache.maven.lifecycle.Lifecycle lifecycle = getLifecycle(mapping.getId());
-                    for (String phase : lifecycle.getPhases()) {
-                        LifecyclePhase lphase = mapping.getLifecyclePhases().get(phase);
-                        if (lphase != null) {
+                    Lifecycle lifecycle = lifecycleRegistry.require(lifecycleEntry.getKey());
+                    for (String phase : lifecycleRegistry.computePhases(lifecycle)) {
+                        List<String> goals = getGoals(lifecycleEntry.getValue(), lifecycle, phase);
+                        if (!goals.isEmpty()) {
                             descriptionBuffer.append("  * ").append(phase).append(LS);
-                            for (LifecycleMojo mojo : lphase.getMojos()) {
-                                descriptionBuffer
-                                        .append("    - ")
-                                        .append(mojo.getGoal())
-                                        .append(LS);
+                            for (String goal : goals) {
+                                descriptionBuffer.append("    - ").append(goal).append(LS);
                             }
                         }
                     }
@@ -110,17 +92,40 @@ public class ListPackagingMojo extends AbstractHelpMojo {
             if (output != null) {
                 writeFile(output, descriptionBuffer);
             } else {
-                getLog().info(LS + "Maven packaging defined:" + LS + LS + descriptionBuffer);
+                log.info(LS + "Maven packaging defined:" + LS + LS + descriptionBuffer);
             }
         } catch (IOException e) {
-            throw new MojoFailureException(e);
+            throw new MojoException(e);
         }
     }
 
-    private org.apache.maven.lifecycle.Lifecycle getLifecycle(String name) {
-        return defaultLifecycles.getLifeCycles().stream()
-                .filter(l -> Objects.equals(name, l.getId()))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("No such lifecycle"));
+    /**
+     * @param container the plugins bound for one lifecycle of a packaging
+     * @param lifecycle the lifecycle
+     * @param phase a phase name of the lifecycle
+     * @return the goals bound to the phase, as <code>groupId:artifactId[:version]:goal</code>
+     */
+    static List<String> getGoals(PluginContainer container, Lifecycle lifecycle, String phase) {
+        // the packagings bind goals to the phases by their Maven 3 names, like process-resources
+        Set<String> names = new HashSet<>();
+        names.add(phase);
+        for (Lifecycle.Alias alias : lifecycle.aliases()) {
+            if (alias.v4Phase().equals(phase)) {
+                names.add(alias.v3Phase());
+            }
+        }
+        List<String> goals = new ArrayList<>();
+        for (Plugin plugin : container.getPlugins()) {
+            for (PluginExecution execution : plugin.getExecutions()) {
+                if (names.contains(execution.getPhase())) {
+                    for (String goal : execution.getGoals()) {
+                        goals.add(plugin.getGroupId() + ":" + plugin.getArtifactId()
+                                + (plugin.getVersion() != null ? ":" + plugin.getVersion() : "")
+                                + ":" + goal);
+                    }
+                }
+            }
+        }
+        return goals;
     }
 }

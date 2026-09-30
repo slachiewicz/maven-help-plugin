@@ -18,49 +18,112 @@
  */
 package org.apache.maven.plugins.help;
 
-import java.lang.reflect.Field;
-import java.util.Properties;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
 
-import org.apache.maven.settings.Profile;
-import org.apache.maven.settings.Settings;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.testing.InjectMojo;
+import org.apache.maven.api.plugin.testing.MojoParameter;
+import org.apache.maven.api.plugin.testing.MojoTest;
+import org.apache.maven.api.services.xml.SettingsXmlFactory;
+import org.apache.maven.api.settings.Profile;
+import org.apache.maven.api.settings.Proxy;
+import org.apache.maven.api.settings.Server;
+import org.apache.maven.api.settings.Settings;
+import org.apache.maven.impl.DefaultSettingsXmlFactory;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
-import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.apache.maven.api.plugin.testing.MojoExtension.setVariableValueToObject;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+/**
+ * Test class for the effective-settings mojo of the Help Plugin.
+ */
+@MojoTest
 class EffectiveSettingsMojoTest {
 
-    @Test
-    void showPasswordsDoesNotMutateSettingsProfiles() throws Exception {
-        EffectiveSettingsMojo mojo = new EffectiveSettingsMojo(null, null);
-        Settings settings = new Settings();
-        Profile profile = new Profile();
-        Properties properties = new Properties();
-        properties.setProperty("key", "value");
-        profile.setProperties(properties);
-        settings.addProfile(profile);
+    private final Session session = mock(Session.class);
 
-        setField(mojo, "settings", settings);
-        setField(mojo, "showPasswords", true);
+    @TempDir
+    private Path tempDir;
+
+    private Path output;
+
+    @BeforeEach
+    void setup() {
+        Settings settings = Settings.newBuilder()
+                .servers(List.of(Server.newBuilder()
+                        .id("my-server")
+                        .username("user")
+                        .password("secret-password")
+                        .passphrase("secret-passphrase")
+                        .build()))
+                .proxies(List.of(Proxy.newBuilder()
+                        .id("my-proxy")
+                        .host("proxy.example.org")
+                        .password("proxy-password")
+                        .build()))
+                .profiles(List.of(Profile.newBuilder()
+                        .id("my-profile")
+                        .properties(Map.of("z", "1", "a", "2"))
+                        .build()))
+                .build();
+        when(session.getSettings()).thenReturn(settings);
+        when(session.getService(SettingsXmlFactory.class)).thenReturn(new DefaultSettingsXmlFactory());
+        output = tempDir.resolve("effective-settings.xml");
+    }
+
+    private void prepare(EffectiveSettingsMojo mojo) throws Exception {
+        setVariableValueToObject(mojo, "session", session);
+        setVariableValueToObject(mojo, "log", mock(Log.class));
+        setVariableValueToObject(mojo, "output", output);
+    }
+
+    @Test
+    @InjectMojo(goal = "effective-settings")
+    void passwordsAreHiddenByDefault(EffectiveSettingsMojo mojo) throws Exception {
+        prepare(mojo);
 
         mojo.execute();
 
-        assertSame(properties, profile.getProperties());
+        String xml = Files.readString(output);
+        assertTrue(xml.contains("<id>my-server</id>"), xml);
+        assertTrue(xml.contains("<password>***</password>"), xml);
+        assertTrue(xml.contains("<passphrase>***</passphrase>"), xml);
+        assertFalse(xml.contains("secret-password"), xml);
+        assertFalse(xml.contains("secret-passphrase"), xml);
+        assertFalse(xml.contains("proxy-password"), xml);
     }
 
-    private static void setField(Object target, String name, Object value) throws ReflectiveOperationException {
-        Class<?> type = target.getClass();
-        Field field = null;
-        while (type != null && field == null) {
-            try {
-                field = type.getDeclaredField(name);
-            } catch (NoSuchFieldException e) {
-                type = type.getSuperclass();
-            }
-        }
-        if (field == null) {
-            throw new NoSuchFieldException(name);
-        }
-        field.setAccessible(true);
-        field.set(target, value);
+    @Test
+    @InjectMojo(goal = "effective-settings")
+    @MojoParameter(name = "showPasswords", value = "true")
+    void passwordsAreShownOnRequest(EffectiveSettingsMojo mojo) throws Exception {
+        prepare(mojo);
+
+        mojo.execute();
+
+        String xml = Files.readString(output);
+        assertTrue(xml.contains("<password>secret-password</password>"), xml);
+        assertTrue(xml.contains("<password>proxy-password</password>"), xml);
+    }
+
+    @Test
+    @InjectMojo(goal = "effective-settings")
+    void propertiesAreSorted(EffectiveSettingsMojo mojo) throws Exception {
+        prepare(mojo);
+
+        mojo.execute();
+
+        String xml = Files.readString(output);
+        assertTrue(xml.indexOf("<a>2</a>") < xml.indexOf("<z>1</z>"), xml);
     }
 }

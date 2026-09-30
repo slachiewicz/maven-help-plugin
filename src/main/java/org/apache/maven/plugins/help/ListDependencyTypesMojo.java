@@ -18,76 +18,61 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.Map;
 import java.util.TreeMap;
 
-import org.apache.maven.artifact.handler.ArtifactHandler;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.project.ProjectBuilder;
-import org.eclipse.aether.RepositorySystem;
+import org.apache.maven.api.JavaPathType;
+import org.apache.maven.api.Type;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.services.TypeRegistry;
 
 /**
  * Displays the list of dependency types that are defined in Maven.
  *
  * @since 3.5.2
  */
-@Mojo(name = "list-dependency-types", requiresProject = false, aggregator = true)
+@Mojo(name = "list-dependency-types", projectRequired = false, aggregator = true)
 public class ListDependencyTypesMojo extends AbstractHelpMojo {
-    /**
-     * The Maven default built-in lifecycles.
-     */
-    private final Map<String, ArtifactHandler> artifactHandlers;
-
-    @Inject
-    public ListDependencyTypesMojo(
-            ProjectBuilder projectBuilder,
-            RepositorySystem repositorySystem,
-            Map<String, ArtifactHandler> artifactHandlers) {
-        super(projectBuilder, repositorySystem);
-        this.artifactHandlers = artifactHandlers;
-    }
-
-    // ----------------------------------------------------------------------
-    // Mojo parameters
-    // ----------------------------------------------------------------------
 
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
-    /**
-     * {@inheritDoc}
-     */
     @Override
-    public void execute() throws MojoExecutionException, MojoFailureException {
+    public void execute() throws MojoException {
         try {
+            TypeRegistry typeRegistry = session.getService(TypeRegistry.class);
+            Map<String, Type> types = new TreeMap<>();
+            // The Maven 4 API can look a type up by its id only, it cannot list the registered ones:
+            // probe the ids Maven itself defines, the constants of Type and the legacy ones.
+            for (String id : knownTypeIds()) {
+                typeRegistry.lookup(id).ifPresent(t -> types.put(id, t));
+            }
+
             StringBuilder descriptionBuffer = new StringBuilder();
-            for (Map.Entry<String, ArtifactHandler> handlerEntry : new TreeMap<>(artifactHandlers).entrySet()) {
-                if ("default".equals(handlerEntry.getKey())) {
-                    continue;
-                }
-                descriptionBuffer.append(handlerEntry.getKey()).append(LS);
-                ArtifactHandler handler = handlerEntry.getValue();
+            for (Map.Entry<String, Type> typeEntry : types.entrySet()) {
+                Type type = typeEntry.getValue();
+                descriptionBuffer.append(typeEntry.getKey()).append(LS);
                 descriptionBuffer
                         .append(" - Extension: ")
                         .append("*.")
-                        .append(handler.getExtension())
+                        .append(type.getExtension())
                         .append(LS);
-                if (handler.getClassifier() != null && !handler.getClassifier().isEmpty()) {
+                if (type.getClassifier() != null && !type.getClassifier().isEmpty()) {
                     descriptionBuffer
                             .append(" - Classifier: ")
-                            .append(handler.getClassifier())
+                            .append(type.getClassifier())
                             .append(LS);
                 }
-                if (handler.isAddedToClasspath()) {
+                if (type.getPathTypes().contains(JavaPathType.CLASSES)
+                        || type.getPathTypes().contains(JavaPathType.MODULES)) {
                     descriptionBuffer.append(" - Added to classpath").append(LS);
                 }
-                if (handler.isIncludesDependencies()) {
+                if (type.isIncludesDependencies()) {
                     descriptionBuffer.append(" - Includes dependencies").append(LS);
                 }
                 descriptionBuffer.append(LS);
@@ -95,10 +80,28 @@ public class ListDependencyTypesMojo extends AbstractHelpMojo {
             if (output != null) {
                 writeFile(output, descriptionBuffer);
             } else {
-                getLog().info(LS + "Maven Dependency Types defined:" + LS + LS + descriptionBuffer);
+                log.info(LS + "Maven Dependency Types defined:" + LS + LS + descriptionBuffer);
             }
         } catch (IOException e) {
-            throw new MojoFailureException(e);
+            throw new MojoException(e);
         }
+    }
+
+    private static Iterable<String> knownTypeIds() {
+        Map<String, String> ids = new TreeMap<>();
+        for (Field field : Type.class.getFields()) {
+            if (Modifier.isStatic(field.getModifiers()) && field.getType() == String.class) {
+                try {
+                    String id = (String) field.get(null);
+                    ids.put(id, id);
+                } catch (IllegalAccessException e) {
+                    // not a constant we can read, skip it
+                }
+            }
+        }
+        for (String id : new String[] {"ejb", "ejb-client", "war", "ear", "rar", "par", "sources", "test-sources"}) {
+            ids.put(id, id);
+        }
+        return ids.keySet();
     }
 }

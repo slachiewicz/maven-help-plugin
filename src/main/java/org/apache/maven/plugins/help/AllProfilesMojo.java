@@ -18,24 +18,17 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
-import org.apache.maven.model.Profile;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.project.ProjectBuilder;
-import org.apache.maven.settings.SettingsUtils;
-import org.eclipse.aether.RepositorySystem;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.model.Profile;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
 
 /**
  * Displays a list of available profiles under the current project.
@@ -47,45 +40,18 @@ import org.eclipse.aether.RepositorySystem;
  * @author <a href="mailto:rahul.thakur.xdev@gmail.com">Rahul Thakur</a>
  * @since 2.1
  */
-@Mojo(name = "all-profiles", requiresProject = false)
+@Mojo(name = "all-profiles", projectRequired = false)
 public class AllProfilesMojo extends AbstractHelpMojo {
-    // ----------------------------------------------------------------------
-    // Mojo parameters
-    // ----------------------------------------------------------------------
-
-    /**
-     * This is the list of projects currently slated to be built by Maven.
-     */
-    @Parameter(defaultValue = "${reactorProjects}", required = true, readonly = true)
-    private List<MavenProject> projects;
-
-    /**
-     * The list of profiles defined in the current Maven settings.
-     */
-    @Parameter(defaultValue = "${settings.profiles}", readonly = true, required = true)
-    private List<org.apache.maven.settings.Profile> settingsProfiles;
-
-    /**
-     * The identifiers of profiles active in the current Maven settings.
-     */
-    @Parameter(defaultValue = "${settings.activeProfiles}", readonly = true, required = true)
-    private List<String> activeSettingsProfiles;
-
-    @Inject
-    public AllProfilesMojo(ProjectBuilder projectBuilder, RepositorySystem repositorySystem) {
-        super(projectBuilder, repositorySystem);
-    }
 
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
-    /** {@inheritDoc} */
     @Override
-    public void execute() throws MojoExecutionException, MojoFailureException {
+    public void execute() throws MojoException {
         StringBuilder descriptionBuffer = new StringBuilder();
 
-        for (MavenProject project : projects) {
+        for (Project project : session.getProjects()) {
             descriptionBuffer
                     .append("Listing Profiles for Project: ")
                     .append(project.getId())
@@ -98,7 +64,7 @@ public class AllProfilesMojo extends AbstractHelpMojo {
 
             // now display
             if (allProfilesByIds.isEmpty()) {
-                getLog().warn("No profiles detected!");
+                log.warn("No profiles detected!");
             } else {
                 // active Profiles will be a subset of *all* profiles
                 allProfilesByIds.keySet().removeAll(activeProfilesByIds.keySet());
@@ -112,12 +78,12 @@ public class AllProfilesMojo extends AbstractHelpMojo {
             try {
                 writeFile(output, descriptionBuffer);
             } catch (IOException e) {
-                throw new MojoExecutionException("Cannot write profiles description to output: " + output, e);
+                throw new MojoException("Cannot write profiles description to output: " + output, e);
             }
 
-            getLog().info("Wrote descriptions to: " + output);
+            log.info("Wrote descriptions to: " + output);
         } else {
-            getLog().info(descriptionBuffer.toString());
+            log.info(descriptionBuffer.toString());
         }
     }
 
@@ -137,61 +103,47 @@ public class AllProfilesMojo extends AbstractHelpMojo {
         }
     }
 
-    /**
-     * Adds the profiles from <code>pom.xml</code> and all of its parents.
-     *
-     * @param project could be null
-     * @param allProfiles Map to add the profiles to.
-     * @param activeProfiles Map to add the active profiles to.
-     */
     private void addProjectPomProfiles(
-            MavenProject project, Map<String, Profile> allProfiles, Map<String, Profile> activeProfiles) {
+            Project project, Map<String, Profile> allProfiles, Map<String, Profile> activeProfiles) {
         if (project == null) {
             // shouldn't happen as this mojo requires a project
-            getLog().debug("No pom.xml found to read Profiles from.");
+            log.debug("No pom.xml found to read Profiles from.");
             return;
         }
 
-        getLog().debug("Attempting to read profiles from pom.xml...");
+        log.debug("Attempting to read profiles from pom.xml...");
 
-        // Keep the current project's activation context while walking its parent models.
+        // Keep the current project's activation context while walking its parent models: a parent profile is
+        // active only if it was injected into the current project, not if it would be active for the parent alone.
         Set<String> injectedProfileIds = new HashSet<>();
-        for (Map.Entry<String, List<String>> entry :
-                project.getInjectedProfileIds().entrySet()) {
-            // External profiles come from settings.xml, not an ancestor POM.
-            if (!"external".equals(entry.getKey())) {
-                injectedProfileIds.addAll(entry.getValue());
-            }
-        }
-        if (project.getActiveProfiles() != null) {
-            for (Profile profile : project.getActiveProfiles()) {
-                activeProfiles.put(profile.getId(), profile);
+        for (Profile profile : project.getEffectiveActiveProfiles()) {
+            activeProfiles.put(profile.getId(), profile);
+            // settings profiles are not ancestor POM profiles
+            if (!Profile.SOURCE_SETTINGS.equals(profile.getSource())) {
+                injectedProfileIds.add(profile.getId());
             }
         }
 
         while (project != null) {
-            for (Profile profile : project.getModel().getProfiles()) {
+            for (Profile profile : project.getDeclaredProfiles()) {
                 allProfiles.put(profile.getId(), profile);
                 if (injectedProfileIds.contains(profile.getId())) {
                     activeProfiles.put(profile.getId(), profile);
                 }
             }
-            project = project.getParent();
+            Optional<Project> parent = project.getParent();
+            project = parent.orElse(null);
         }
     }
 
-    /**
-     * Adds the profiles from <code>settings.xml</code>.
-     *
-     * @param allProfiles Map to add the profiles to.
-     * @param activeProfiles Map to add the active profiles to.
-     */
     private void addSettingsProfiles(Map<String, Profile> allProfiles, Map<String, Profile> activeProfiles) {
-        getLog().debug("Attempting to read profiles from settings.xml...");
-        for (org.apache.maven.settings.Profile settingsProfile : settingsProfiles) {
-            Profile profile = SettingsUtils.convertFromSettingsProfile(settingsProfile);
+        log.debug("Attempting to read profiles from settings.xml...");
+        for (org.apache.maven.api.settings.Profile settingsProfile :
+                session.getSettings().getProfiles()) {
+            Profile profile = Profile.newBuilder().id(settingsProfile.getId()).build();
+            profile.setSource(Profile.SOURCE_SETTINGS);
             allProfiles.put(profile.getId(), profile);
-            if (activeSettingsProfiles.contains(profile.getId())) {
+            if (session.getSettings().getActiveProfiles().contains(profile.getId())) {
                 activeProfiles.put(profile.getId(), profile);
             }
         }

@@ -18,49 +18,50 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
 
-import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import org.apache.maven.RepositoryUtils;
-import org.apache.maven.lifecycle.DefaultLifecycles;
-import org.apache.maven.lifecycle.Lifecycle;
-import org.apache.maven.lifecycle.internal.MojoDescriptorCreator;
-import org.apache.maven.lifecycle.mapping.LifecycleMapping;
-import org.apache.maven.lifecycle.mapping.LifecycleMojo;
-import org.apache.maven.lifecycle.mapping.LifecyclePhase;
-import org.apache.maven.model.Plugin;
-import org.apache.maven.model.building.ModelBuildingRequest;
-import org.apache.maven.plugin.MavenPluginManager;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.plugin.descriptor.MojoDescriptor;
-import org.apache.maven.plugin.descriptor.Parameter;
-import org.apache.maven.plugin.descriptor.PluginDescriptor;
-import org.apache.maven.plugin.prefix.NoPluginFoundForPrefixException;
-import org.apache.maven.plugin.version.DefaultPluginVersionRequest;
-import org.apache.maven.plugin.version.PluginVersionResolutionException;
-import org.apache.maven.plugin.version.PluginVersionResolver;
-import org.apache.maven.plugin.version.PluginVersionResult;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.project.DefaultProjectBuildingRequest;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.project.ProjectBuilder;
-import org.apache.maven.project.ProjectBuildingRequest;
+import org.apache.maven.api.Lifecycle;
+import org.apache.maven.api.PathScope;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.RemoteRepository;
+import org.apache.maven.api.model.Build;
+import org.apache.maven.api.model.Plugin;
+import org.apache.maven.api.model.PluginContainer;
+import org.apache.maven.api.model.PluginExecution;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.plugin.annotations.Parameter;
+import org.apache.maven.api.plugin.descriptor.MojoDescriptor;
+import org.apache.maven.api.plugin.descriptor.PluginDescriptor;
+import org.apache.maven.api.services.LifecycleRegistry;
+import org.apache.maven.api.services.ProjectBuilder;
+import org.apache.maven.api.services.ProjectBuilderRequest;
+import org.apache.maven.api.services.ProjectManager;
+import org.apache.maven.api.services.xml.ModelXmlFactory;
+import org.apache.maven.api.services.xml.PluginXmlFactory;
 import org.apache.maven.reporting.MavenReport;
 import org.apache.maven.tools.plugin.generator.HtmlToPlainTextConverter;
-import org.eclipse.aether.RepositorySystem;
-import org.eclipse.aether.artifact.Artifact;
-import org.eclipse.aether.artifact.DefaultArtifact;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
 
 /**
  * Displays a list of the attributes for a Maven Plugin and/or goals (aka Mojo - Maven plain Old Java Object).
@@ -68,7 +69,7 @@ import org.eclipse.aether.artifact.DefaultArtifact;
  * @see <a href="http://maven.apache.org/general.html#What_is_a_Mojo">What is a Mojo?</a>
  * @since 2.0
  */
-@Mojo(name = "describe", requiresProject = false, aggregator = true)
+@Mojo(name = "describe", projectRequired = false, aggregator = true)
 public class DescribeMojo extends AbstractHelpMojo {
     /**
      * The default indent size when writing description's Mojo.
@@ -92,52 +93,15 @@ public class DescribeMojo extends AbstractHelpMojo {
 
     private static final Pattern EXPRESSION = Pattern.compile("^\\$\\{([^}]+)\\}$");
 
-    // ----------------------------------------------------------------------
-    // Mojo components
-    // ----------------------------------------------------------------------
+    /**
+     * The location of the plugin descriptor in a plugin jar.
+     */
+    private static final String PLUGIN_DESCRIPTOR = "META-INF/maven/plugin.xml";
 
     /**
-     * Component used to get a plugin descriptor from a given plugin.
+     * The plugin groups Maven searches besides the plugin groups of the settings.
      */
-    protected final MavenPluginManager pluginManager;
-
-    /**
-     * Component used to get a plugin by its prefix and get mojo descriptors.
-     */
-    private final MojoDescriptorCreator mojoDescriptorCreator;
-
-    /**
-     * Component used to resolve the version for a plugin.
-     */
-    private final PluginVersionResolver pluginVersionResolver;
-
-    /**
-     * The Maven default built-in lifecycles.
-     */
-    private final DefaultLifecycles defaultLifecycles;
-
-    /**
-     * A map from each packaging to its lifecycle mapping.
-     */
-    private final Map<String, LifecycleMapping> lifecycleMappings;
-
-    @Inject
-    public DescribeMojo(
-            ProjectBuilder projectBuilder,
-            RepositorySystem repositorySystem,
-            MavenPluginManager pluginManager,
-            MojoDescriptorCreator mojoDescriptorCreator,
-            PluginVersionResolver pluginVersionResolver,
-            DefaultLifecycles defaultLifecycles,
-            Map<String, LifecycleMapping> lifecycleMappings) {
-
-        super(projectBuilder, repositorySystem);
-        this.pluginManager = pluginManager;
-        this.mojoDescriptorCreator = mojoDescriptorCreator;
-        this.pluginVersionResolver = pluginVersionResolver;
-        this.defaultLifecycles = defaultLifecycles;
-        this.lifecycleMappings = lifecycleMappings;
-    }
+    private static final List<String> DEFAULT_PLUGIN_GROUPS = List.of("org.apache.maven.plugins", "org.codehaus.mojo");
 
     // ----------------------------------------------------------------------
     // Mojo parameters
@@ -152,7 +116,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      * <li>groupId:artifactId:version, i.e. 'org.apache.maven.plugins:maven-help-plugin:2.0'</li>
      * </ol>
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "plugin", alias = "prefix")
+    @Parameter(property = "plugin", alias = "prefix")
     private String plugin;
 
     /**
@@ -160,7 +124,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      * <br/>
      * <b>Note</b>: Should be used with <code>artifactId</code> parameter.
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "groupId")
+    @Parameter(property = "groupId")
     private String groupId;
 
     /**
@@ -168,7 +132,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      * <br/>
      * <b>Note</b>: Should be used with <code>groupId</code> parameter.
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "artifactId")
+    @Parameter(property = "artifactId")
     private String artifactId;
 
     /**
@@ -176,7 +140,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      * <br/>
      * <b>Note</b>: Should be used with <code>groupId/artifactId</code> parameters.
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "version")
+    @Parameter(property = "version")
     private String version;
 
     /**
@@ -186,7 +150,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      *
      * @since 2.1
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "goal")
+    @Parameter(property = "goal")
     private String goal;
 
     /**
@@ -194,7 +158,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      *
      * @since 2.1
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "detail", defaultValue = "false")
+    @Parameter(property = "detail", defaultValue = "false")
     private boolean detail;
 
     /**
@@ -202,7 +166,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      *
      * @since 2.1
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "minimal", defaultValue = "false")
+    @Parameter(property = "minimal", defaultValue = "false")
     private boolean minimal;
 
     /**
@@ -212,7 +176,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      *
      * @since 2.1
      */
-    @org.apache.maven.plugins.annotations.Parameter(property = "cmd")
+    @Parameter(property = "cmd")
     private String cmd;
 
     // ----------------------------------------------------------------------
@@ -223,7 +187,7 @@ public class DescribeMojo extends AbstractHelpMojo {
      * {@inheritDoc}
      */
     @Override
-    public void execute() throws MojoExecutionException, MojoFailureException {
+    public void execute() throws MojoException {
         StringBuilder descriptionBuffer = new StringBuilder();
 
         boolean describePlugin = true;
@@ -233,16 +197,17 @@ public class DescribeMojo extends AbstractHelpMojo {
 
         if (describePlugin) {
             PluginInfo pi = parsePluginLookupInfo();
-            PluginDescriptor descriptor = lookupPluginDescriptor(pi);
+            LoadedPlugin loaded = lookupPluginDescriptor(pi);
+            PluginDescriptor descriptor = loaded.descriptor;
             if (goal != null && !goal.isEmpty()) {
-                MojoDescriptor mojo = descriptor.getMojo(goal);
-                if (mojo == null) {
-                    throw new MojoFailureException(
-                            "The goal '" + goal + "' does not exist in the plugin '" + pi.getPrefix() + "'");
-                }
-                describeMojo(mojo, descriptionBuffer);
+                MojoDescriptor mojo = descriptor.getMojos().stream()
+                        .filter(m -> goal.equals(m.getGoal()))
+                        .findFirst()
+                        .orElseThrow(() -> new MojoException(
+                                "The goal '" + goal + "' does not exist in the plugin '" + pi.getPrefix() + "'"));
+                describeMojo(loaded, mojo, descriptionBuffer);
             } else {
-                describePlugin(descriptor, descriptionBuffer);
+                describePlugin(loaded, descriptionBuffer);
             }
         }
 
@@ -257,46 +222,74 @@ public class DescribeMojo extends AbstractHelpMojo {
      * Method to write the Mojo description to the output file
      *
      * @param descriptionBuffer contains the description to be written to the file
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private void writeDescription(StringBuilder descriptionBuffer) throws MojoExecutionException {
+    private void writeDescription(StringBuilder descriptionBuffer) throws MojoException {
         if (output != null) {
             try {
                 writeFile(output, descriptionBuffer);
             } catch (IOException e) {
-                throw new MojoExecutionException("Cannot write plugin/goal description to output: " + output, e);
+                throw new MojoException("Cannot write plugin/goal description to output: " + output, e);
             }
 
-            getLog().info("Wrote descriptions to: " + output);
+            log.info("Wrote descriptions to: " + output);
         } else {
-            getLog().info(descriptionBuffer.toString());
+            log.info(descriptionBuffer.toString());
         }
+    }
+
+    /**
+     * A plugin descriptor with the parameter configuration read from the descriptor file, because the Maven 4 model
+     * of a plugin descriptor does not keep the default values and the expressions of a Maven 3 plugin descriptor.
+     */
+    static final class LoadedPlugin {
+        final PluginDescriptor descriptor;
+
+        /** goal, then parameter name, to {default value, expression} */
+        final Map<String, Map<String, String[]>> configuration;
+
+        LoadedPlugin(PluginDescriptor descriptor, Map<String, Map<String, String[]>> configuration) {
+            this.descriptor = descriptor;
+            this.configuration = configuration;
+        }
+
+        String defaultValue(MojoDescriptor md, org.apache.maven.api.plugin.descriptor.Parameter parameter) {
+            if (parameter.getDefaultValue() != null) {
+                return parameter.getDefaultValue();
+            }
+            String[] values = configuration.getOrDefault(md.getGoal(), Map.of()).get(parameter.getName());
+            return values != null ? values[0] : null;
+        }
+
+        String expression(MojoDescriptor md, org.apache.maven.api.plugin.descriptor.Parameter parameter) {
+            if (parameter.getExpression() != null && !parameter.getExpression().isEmpty()) {
+                return parameter.getExpression();
+            }
+            String[] values = configuration.getOrDefault(md.getGoal(), Map.of()).get(parameter.getName());
+            return values != null ? values[1] : null;
+        }
+    }
+
+    private static boolean isNotEmpty(String str) {
+        return str != null && !str.isEmpty();
     }
 
     /**
      * Method for retrieving the description of the plugin
      *
      * @param pi holds information of the plugin whose description is to be retrieved
-     * @return a PluginDescriptor where the plugin description is to be retrieved
-     * @throws MojoExecutionException if the plugin could not be verify
-     * @throws MojoFailureException   if groupId or artifactId is empty
+     * @return a plugin descriptor where the plugin description is to be retrieved
+     * @throws MojoException if the plugin could not be verify, or if groupId or artifactId is empty
      */
-    private static boolean isNotEmpty(String str) {
-        return str != null && !str.isEmpty();
-    }
+    private LoadedPlugin lookupPluginDescriptor(PluginInfo pi) throws MojoException {
+        List<RemoteRepository> repositories =
+                session.getService(ProjectManager.class).getRemotePluginRepositories(project);
 
-    private PluginDescriptor lookupPluginDescriptor(PluginInfo pi) throws MojoExecutionException, MojoFailureException {
-        Plugin forLookup = null;
+        Coordinates forLookup = null;
         if (isNotEmpty(pi.getPrefix())) {
-            try {
-                forLookup = mojoDescriptorCreator.findPluginForPrefix(pi.getPrefix(), session);
-            } catch (NoPluginFoundForPrefixException e) {
-                throw new MojoExecutionException("Unable to find the plugin with prefix: " + pi.getPrefix(), e);
-            }
+            forLookup = findPluginForPrefix(pi.getPrefix(), repositories);
         } else if (isNotEmpty(pi.getGroupId()) && isNotEmpty(pi.getArtifactId())) {
-            forLookup = new Plugin();
-            forLookup.setGroupId(pi.getGroupId());
-            forLookup.setArtifactId(pi.getArtifactId());
+            forLookup = new Coordinates(pi.getGroupId(), pi.getArtifactId(), null);
         }
         if (forLookup == null) {
             String msg = "You must specify either: both 'groupId' and 'artifactId' parameters OR a 'plugin' parameter"
@@ -310,45 +303,187 @@ public class DescribeMojo extends AbstractHelpMojo {
                     + "  # mvn help:describe -DgroupId=org.apache.maven.plugins -DartifactId=maven-help-plugin" + LS
                     + LS
                     + "Try 'mvn help:help -Ddetail=true' for more information.";
-            throw new MojoFailureException(msg);
+            throw new MojoException(msg);
         }
 
+        String pluginVersion;
         if (isNotEmpty(pi.getVersion())) {
-            forLookup.setVersion(pi.getVersion());
+            pluginVersion = pi.getVersion();
+        } else if (forLookup.version != null) {
+            pluginVersion = forLookup.version;
         } else {
             try {
-                DefaultPluginVersionRequest versionRequest = new DefaultPluginVersionRequest(forLookup, session);
-                versionRequest.setPom(project.getModel());
-                PluginVersionResult versionResult = pluginVersionResolver.resolve(versionRequest);
-                forLookup.setVersion(versionResult.getVersion());
-            } catch (PluginVersionResolutionException e) {
-                throw new MojoExecutionException(
+                pluginVersion = resolvePluginVersion(forLookup, repositories);
+            } catch (RuntimeException e) {
+                throw new MojoException(
                         "Unable to resolve the version of the plugin with prefix: " + pi.getPrefix(), e);
             }
         }
 
         try {
-            return pluginManager.getPluginDescriptor(
-                    forLookup, project.getRemotePluginRepositories(), session.getRepositorySession());
+            Path jar = resolveArtifactPath(
+                    new Coordinates(forLookup.groupId, forLookup.artifactId, pluginVersion), "jar", repositories);
+            return readPluginDescriptor(jar);
         } catch (Exception e) {
-            throw new MojoExecutionException(
+            throw new MojoException(
                     "Error retrieving plugin descriptor for:" + LS + LS + "groupId: '"
-                            + forLookup.getGroupId() + "'" + LS + "artifactId: '" + forLookup.getArtifactId()
-                            + "'" + LS + "version: '" + forLookup.getVersion()
-                            + "'" + LS
+                            + forLookup.groupId + "'" + LS + "artifactId: '" + forLookup.artifactId + "'" + LS
+                            + "version: '" + pluginVersion + "'" + LS
                             + LS,
                     e);
         }
     }
 
     /**
+     * @return the plugins the project configures, in its build and in its plugin management
+     */
+    private List<Plugin> projectPlugins() {
+        List<Plugin> candidates = new ArrayList<>();
+        Build build = project.getModel().getBuild();
+        if (build != null) {
+            candidates.addAll(build.getPlugins());
+            if (build.getPluginManagement() != null) {
+                candidates.addAll(build.getPluginManagement().getPlugins());
+            }
+        }
+        return candidates;
+    }
+
+    /**
+     * Finds the version of a plugin: the one the project configures, else the latest one.
+     */
+    private String resolvePluginVersion(Coordinates plugin, List<RemoteRepository> repositories) {
+        for (Plugin candidate : projectPlugins()) {
+            if (plugin.groupId.equals(candidate.getGroupId())
+                    && plugin.artifactId.equals(candidate.getArtifactId())
+                    && candidate.getVersion() != null) {
+                return candidate.getVersion();
+            }
+        }
+        return resolveLatestVersion(plugin, repositories).toString();
+    }
+
+    /**
+     * Finds the plugin for a goal prefix. The Maven 4 API has no access to the plugin prefix metadata of the
+     * repositories, so the plugins of the project, and then the plugins named after the conventions
+     * <code>maven-PREFIX-plugin</code> and <code>PREFIX-maven-plugin</code> in the plugin groups, are tried.
+     *
+     * @param prefix not null
+     * @param repositories the plugin repositories
+     * @return the plugin, the version is {@code null} if the project does not configure one
+     * @throws MojoException if no plugin is found
+     */
+    private Coordinates findPluginForPrefix(String prefix, List<RemoteRepository> repositories) throws MojoException {
+        for (Plugin candidate : projectPlugins()) {
+            if (prefix.equals(goalPrefix(candidate.getArtifactId()))) {
+                return new Coordinates(candidate.getGroupId(), candidate.getArtifactId(), candidate.getVersion());
+            }
+        }
+
+        List<String> groups = new ArrayList<>(session.getSettings().getPluginGroups());
+        DEFAULT_PLUGIN_GROUPS.stream().filter(g -> !groups.contains(g)).forEach(groups::add);
+        for (String group : groups) {
+            for (String artifactId : new String[] {"maven-" + prefix + "-plugin", prefix + "-maven-plugin"}) {
+                try {
+                    Coordinates candidate = new Coordinates(group, artifactId, null);
+                    resolveLatestVersion(candidate, repositories);
+                    return candidate;
+                } catch (RuntimeException e) {
+                    log.debug("No plugin " + group + ":" + artifactId + " for the prefix " + prefix, e);
+                }
+            }
+        }
+        throw new MojoException("Unable to find the plugin with prefix: " + prefix);
+    }
+
+    /**
+     * @param artifactId a plugin artifactId
+     * @return the goal prefix, following the naming convention, or {@code null} if the artifactId does not follow it
+     */
+    static String goalPrefix(String artifactId) {
+        if (artifactId.startsWith("maven-") && artifactId.endsWith("-plugin")) {
+            return artifactId.substring("maven-".length(), artifactId.length() - "-plugin".length());
+        }
+        if (artifactId.endsWith("-maven-plugin")) {
+            return artifactId.substring(0, artifactId.length() - "-maven-plugin".length());
+        }
+        return null;
+    }
+
+    private LoadedPlugin readPluginDescriptor(Path jar) throws IOException {
+        try (JarFile jarFile = new JarFile(jar.toFile())) {
+            JarEntry entry = jarFile.getJarEntry(PLUGIN_DESCRIPTOR);
+            if (entry == null) {
+                throw new IOException("No " + PLUGIN_DESCRIPTOR + " in " + jar);
+            }
+            PluginDescriptor descriptor;
+            try (InputStream is = jarFile.getInputStream(entry)) {
+                // not strict: a descriptor of a Maven 3 plugin has elements unknown to the Maven 4 model
+                descriptor = session.getService(PluginXmlFactory.class).read(is, false);
+            }
+            try (InputStream is = jarFile.getInputStream(entry)) {
+                return new LoadedPlugin(descriptor, readConfiguration(is));
+            }
+        }
+    }
+
+    /**
+     * Reads the <code>configuration</code> element of each mojo of a plugin descriptor.
+     */
+    private static Map<String, Map<String, String[]>> readConfiguration(InputStream is) throws IOException {
+        Map<String, Map<String, String[]>> result = new HashMap<>();
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            Document document = factory.newDocumentBuilder().parse(is);
+            NodeList mojos = document.getElementsByTagName("mojo");
+            for (int i = 0; i < mojos.getLength(); i++) {
+                Element mojo = (Element) mojos.item(i);
+                String mojoGoal = childText(mojo, "goal");
+                Element configuration = child(mojo, "configuration");
+                if (mojoGoal == null || configuration == null) {
+                    continue;
+                }
+                Map<String, String[]> parameters = new HashMap<>();
+                for (Node n = configuration.getFirstChild(); n != null; n = n.getNextSibling()) {
+                    if (n instanceof Element) {
+                        Element e = (Element) n;
+                        String defaultValue = e.hasAttribute("default-value") ? e.getAttribute("default-value") : null;
+                        String text = e.getTextContent();
+                        parameters.put(e.getTagName(), new String[] {defaultValue, text.isEmpty() ? null : text});
+                    }
+                }
+                result.put(mojoGoal, parameters);
+            }
+        } catch (javax.xml.parsers.ParserConfigurationException | SAXException e) {
+            throw new IOException("Cannot read the configuration of " + PLUGIN_DESCRIPTOR, e);
+        }
+        return result;
+    }
+
+    private static Element child(Element parent, String name) {
+        for (Node n = parent.getFirstChild(); n != null; n = n.getNextSibling()) {
+            if (n instanceof Element && name.equals(((Element) n).getTagName())) {
+                return (Element) n;
+            }
+        }
+        return null;
+    }
+
+    private static String childText(Element parent, String name) {
+        Element e = child(parent, name);
+        return e != null ? e.getTextContent() : null;
+    }
+
+    /**
      * Method for parsing the plugin parameter
      *
      * @return Plugin info containing information about the plugin whose description is to be retrieved
-     * @throws MojoFailureException if <code>plugin<*code> parameter is not conform to
+     * @throws MojoException if <code>plugin<*code> parameter is not conform to
      *                              <code>groupId:artifactId[:version]</code>
      */
-    private PluginInfo parsePluginLookupInfo() throws MojoFailureException {
+    private PluginInfo parsePluginLookupInfo() throws MojoException {
         PluginInfo pi = new PluginInfo();
         if (plugin != null && !plugin.isEmpty()) {
             if (plugin.indexOf(':') > -1) {
@@ -368,7 +503,7 @@ public class DescribeMojo extends AbstractHelpMojo {
                         pi.setVersion(pluginParts[2]);
                         break;
                     default:
-                        throw new MojoFailureException("plugin parameter must be a plugin prefix,"
+                        throw new MojoException("plugin parameter must be a plugin prefix,"
                                 + " or conform to: 'groupId:artifactId[:version]'.");
                 }
             } else {
@@ -385,49 +520,41 @@ public class DescribeMojo extends AbstractHelpMojo {
     /**
      * Method for retrieving the plugin description
      *
-     * @param pd     contains the plugin description
+     * @param loaded contains the plugin description
      * @param buffer contains the information to be displayed or printed
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private void describePlugin(PluginDescriptor pd, StringBuilder buffer)
-            throws MojoFailureException, MojoExecutionException {
+    private void describePlugin(LoadedPlugin loaded, StringBuilder buffer) throws MojoException {
+        PluginDescriptor pd = loaded.descriptor;
         append(buffer, pd.getId(), 0);
         buffer.append(LS);
 
         String name = pd.getName();
         if (name == null) {
             // Can be null because of MPLUGIN-137 (and descriptors generated with maven-plugin-tools-api <= 2.4.3)
-            Artifact aetherArtifact = new DefaultArtifact(pd.getGroupId(), pd.getArtifactId(), "jar", pd.getVersion());
-            ProjectBuildingRequest pbr = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
-            pbr.setRemoteRepositories(project.getRemoteArtifactRepositories());
-            pbr.setPluginArtifactRepositories(project.getPluginArtifactRepositories());
-            pbr.setProject(null);
-            pbr.setValidationLevel(ModelBuildingRequest.VALIDATION_LEVEL_MINIMAL);
             try {
-                Artifact artifactCopy = resolveArtifact(aetherArtifact, project.getRemotePluginRepositories())
-                        .getArtifact();
-                name = projectBuilder
-                        .build(RepositoryUtils.toArtifact(artifactCopy), pbr)
-                        .getProject()
-                        .getName();
+                Path pom = resolveArtifactPath(
+                        new Coordinates(pd.getGroupId(), pd.getArtifactId(), pd.getVersion()),
+                        "pom",
+                        session.getService(ProjectManager.class).getRemotePluginRepositories(project));
+                name = readProjectName(pom);
             } catch (Exception e) {
                 // oh well, we tried our best.
-                getLog().warn("Unable to get the name of the plugin " + pd.getId() + ": " + e.getMessage());
+                log.warn("Unable to get the name of the plugin " + pd.getId() + ": " + e.getMessage());
                 name = pd.getId();
             }
         }
-        append(buffer, "Name", buffer().strong(name).build(), 0);
+        append(buffer, "Name", strong(name), 0);
         appendAsParagraph(buffer, "Description", toDescription(pd.getDescription()), 0);
         append(buffer, "Group Id", pd.getGroupId(), 0);
         append(buffer, "Artifact Id", pd.getArtifactId(), 0);
         append(buffer, "Version", pd.getVersion(), 0);
-        append(buffer, "Goal Prefix", buffer().strong(pd.getGoalPrefix()).build(), 0);
+        append(buffer, "Goal Prefix", strong(pd.getGoalPrefix()), 0);
         buffer.append(LS);
 
         List<MojoDescriptor> mojos = pd.getMojos();
 
-        if (mojos == null) {
+        if (mojos == null || mojos.isEmpty()) {
             append(buffer, "This plugin has no goals.", 0);
             return;
         }
@@ -441,7 +568,7 @@ public class DescribeMojo extends AbstractHelpMojo {
                     .collect(Collectors.toList());
 
             for (MojoDescriptor md : mojos) {
-                describeMojoGuts(md, buffer, detail);
+                describeMojoGuts(loaded, md, buffer, detail);
                 buffer.append(LS);
             }
         }
@@ -455,17 +582,16 @@ public class DescribeMojo extends AbstractHelpMojo {
     /**
      * Displays information about the Plugin Mojo
      *
+     * @param loaded the plugin descriptor
      * @param md     contains the description of the Plugin Mojo
      * @param buffer the displayed output
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private void describeMojo(MojoDescriptor md, StringBuilder buffer)
-            throws MojoFailureException, MojoExecutionException {
-        buffer.append("Mojo: '").append(md.getFullGoalName()).append("'");
+    private void describeMojo(LoadedPlugin loaded, MojoDescriptor md, StringBuilder buffer) throws MojoException {
+        buffer.append("Mojo: '").append(fullGoalName(loaded, md)).append("'");
         buffer.append(LS);
 
-        describeMojoGuts(md, buffer, detail);
+        describeMojoGuts(loaded, md, buffer, detail);
         buffer.append(LS);
 
         if (!detail) {
@@ -475,17 +601,42 @@ public class DescribeMojo extends AbstractHelpMojo {
     }
 
     /**
+     * Reads the name of the project of a POM. The POM is built, which has the name of its parent when it has none,
+     * unless it is one of the old POMs that Maven 4 cannot build: then its name is the one the file declares.
+     */
+    private String readProjectName(Path pom) {
+        try {
+            return session.getService(ProjectBuilder.class)
+                    .build(ProjectBuilderRequest.builder()
+                            .session(session)
+                            .path(pom)
+                            .build())
+                    .getProject()
+                    .orElseThrow(() -> new MojoException("No project was built for " + pom))
+                    .getModel()
+                    .getName();
+        } catch (RuntimeException e) {
+            log.debug("Cannot build " + pom + ", reading its name", e);
+            return session.getService(ModelXmlFactory.class).read(pom, false).getName();
+        }
+    }
+
+    private static String fullGoalName(LoadedPlugin loaded, MojoDescriptor md) {
+        return loaded.descriptor.getGoalPrefix() + ":" + md.getGoal();
+    }
+
+    /**
      * Displays detailed information about the Plugin Mojo
      *
+     * @param loaded          the plugin descriptor
      * @param md              contains the description of the Plugin Mojo
      * @param buffer          contains information to be printed or displayed
      * @param fullDescription specifies whether all the details about the Plugin Mojo is to  be displayed
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private void describeMojoGuts(MojoDescriptor md, StringBuilder buffer, boolean fullDescription)
-            throws MojoFailureException, MojoExecutionException {
-        append(buffer, buffer().strong(md.getFullGoalName()).build(), 0);
+    private void describeMojoGuts(LoadedPlugin loaded, MojoDescriptor md, StringBuilder buffer, boolean fullDescription)
+            throws MojoException {
+        append(buffer, strong(fullGoalName(loaded, md)), 0);
 
         // indent 1
         appendAsParagraph(buffer, "Description", toDescription(md.getDescription()), 1);
@@ -496,10 +647,10 @@ public class DescribeMojo extends AbstractHelpMojo {
         }
 
         if (deprecation != null) {
-            append(buffer, buffer().warning("Deprecated. " + deprecation).build(), 1);
+            append(buffer, warning("Deprecated. " + deprecation), 1);
         }
 
-        if (isReportGoal(md)) {
+        if (isReportGoal(loaded, md)) {
             append(buffer, "Note", "This goal should be used as a Maven report.", 1);
         }
 
@@ -539,20 +690,20 @@ public class DescribeMojo extends AbstractHelpMojo {
 
         buffer.append(LS);
 
-        describeMojoParameters(md, buffer);
+        describeMojoParameters(loaded, md, buffer);
     }
 
     /**
      * Displays parameter information of the Plugin Mojo
      *
+     * @param loaded the plugin descriptor
      * @param md     contains the description of the Plugin Mojo
      * @param buffer contains information to be printed or displayed
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private void describeMojoParameters(MojoDescriptor md, StringBuilder buffer)
-            throws MojoFailureException, MojoExecutionException {
-        List<Parameter> params = md.getParameters();
+    private void describeMojoParameters(LoadedPlugin loaded, MojoDescriptor md, StringBuilder buffer)
+            throws MojoException {
+        List<org.apache.maven.api.plugin.descriptor.Parameter> params = md.getParameters();
 
         if (params == null || params.isEmpty()) {
             append(buffer, "This mojo doesn't use any parameters.", 1);
@@ -566,27 +717,20 @@ public class DescribeMojo extends AbstractHelpMojo {
         append(buffer, "Available parameters:", 1);
 
         // indent 2
-        for (Parameter parameter : params) {
+        for (org.apache.maven.api.plugin.descriptor.Parameter parameter : params) {
             if (!parameter.isEditable()) {
                 continue;
             }
 
             buffer.append(LS);
 
-            // DGF wouldn't it be nice if this worked?
-            String defaultVal = parameter.getDefaultValue();
-            if (defaultVal == null) {
-                // defaultVal is ALWAYS null, this is a bug in PluginDescriptorBuilder (cf. MNG-4941)
-                defaultVal =
-                        md.getMojoConfiguration().getChild(parameter.getName()).getAttribute("default-value", null);
-            }
-
+            String defaultVal = loaded.defaultValue(md, parameter);
             if (defaultVal != null && !defaultVal.isEmpty()) {
-                defaultVal = " (Default: " + buffer().strong(defaultVal).build() + ")";
+                defaultVal = " (Default: " + strong(defaultVal) + ")";
             } else {
                 defaultVal = "";
             }
-            append(buffer, buffer().strong(parameter.getName()).build() + defaultVal, 2);
+            append(buffer, strong(parameter.getName()) + defaultVal, 2);
 
             String alias = parameter.getAlias();
             if (!(alias == null || alias.isEmpty())) {
@@ -597,13 +741,7 @@ public class DescribeMojo extends AbstractHelpMojo {
                 append(buffer, "Required", "true", 3);
             }
 
-            String expression = parameter.getExpression();
-            if (expression == null || expression.isEmpty()) {
-                // expression is ALWAYS null, this is a bug in PluginDescriptorBuilder (cf. MNG-4941).
-                // Fixed with Maven-3.0.1
-                expression =
-                        md.getMojoConfiguration().getChild(parameter.getName()).getValue(null);
-            }
+            String expression = loaded.expression(md, parameter);
             if (expression != null && !expression.isEmpty()) {
                 Matcher matcher = EXPRESSION.matcher(expression);
                 if (matcher.matches()) {
@@ -621,7 +759,7 @@ public class DescribeMojo extends AbstractHelpMojo {
             }
 
             if (deprecation != null) {
-                append(buffer, buffer().warning("Deprecated. " + deprecation).build(), 3);
+                append(buffer, warning("Deprecated. " + deprecation), 3);
             }
         }
     }
@@ -631,69 +769,98 @@ public class DescribeMojo extends AbstractHelpMojo {
      *
      * @param descriptionBuffer not null
      * @return <code>true</code> if it implies to describe a plugin, <code>false</code> otherwise.
-     * @throws MojoExecutionException if any
+     * @throws MojoException if any
      */
-    private boolean describeCommand(StringBuilder descriptionBuffer) throws MojoExecutionException {
+    private boolean describeCommand(StringBuilder descriptionBuffer) throws MojoException {
         if (cmd.indexOf(':') == -1) {
             // phase
-            Lifecycle lifecycle = defaultLifecycles.getPhaseToLifecycleMap().get(cmd);
+            LifecycleRegistry lifecycleRegistry = session.getService(LifecycleRegistry.class);
+            Lifecycle lifecycle = null;
+            // the phase, by its Maven 4 name: the Maven 3 names of the phases, like process-resources, are aliases
+            String phaseName = cmd;
+            for (Lifecycle candidate : lifecycleRegistry) {
+                if (lifecycleRegistry.computePhases(candidate).contains(cmd)) {
+                    lifecycle = candidate;
+                    break;
+                }
+                for (Lifecycle.Alias alias : candidate.aliases()) {
+                    if (alias.v3Phase().equals(cmd)) {
+                        lifecycle = candidate;
+                        phaseName = alias.v4Phase();
+                        break;
+                    }
+                }
+                if (lifecycle != null) {
+                    break;
+                }
+            }
             if (lifecycle == null) {
-                throw new MojoExecutionException("The given phase '" + cmd + "' is an unknown phase.");
+                throw new MojoException("The given phase '" + cmd + "' is an unknown phase.");
             }
 
-            List<String> phases = lifecycle.getPhases();
+            List<String> phases = lifecycleRegistry.computePhases(lifecycle);
 
-            if (lifecycle.getDefaultLifecyclePhases() == null
-                    || lifecycle.getDefaultLifecyclePhases().isEmpty()) {
-                Map<String, LifecyclePhase> defaultLifecyclePhases = lifecycleMappings
-                        .get(project.getPackaging())
-                        .getLifecycles()
-                        .get("default")
-                        .getLifecyclePhases();
+            // the bindings of the lifecycle itself, like the ones of the clean and site lifecycles
+            Map<String, List<String>> lifecycleBindings = new HashMap<>();
+            lifecycle.allPhases().forEach(p -> {
+                if (!p.plugins().isEmpty()) {
+                    lifecycleBindings.put(p.name(), goals(p.plugins(), p.name()));
+                }
+            });
+
+            if (lifecycleBindings.isEmpty()) {
+                // the bindings of the packaging of the project
+                PluginContainer packagingPlugins =
+                        project.getPackaging().plugins().get(lifecycle.id());
+                Map<String, List<String>> defaultLifecyclePhases = new HashMap<>();
+                for (String key : phases) {
+                    List<String> goals = packagingPlugins != null
+                            ? ListPackagingMojo.getGoals(packagingPlugins, lifecycle, key)
+                            : List.of();
+                    if (!goals.isEmpty()) {
+                        defaultLifecyclePhases.put(key, goals);
+                    }
+                }
 
                 descriptionBuffer.append("'").append(cmd);
                 descriptionBuffer
                         .append("' is a phase corresponding to this plugin:")
                         .append(LS);
                 for (String key : phases) {
-                    if (!key.equals(cmd)) {
+                    if (!key.equals(phaseName)) {
                         continue;
                     }
                     if (defaultLifecyclePhases.get(key) != null) {
-                        descriptionBuffer.append(defaultLifecyclePhases.get(key));
+                        descriptionBuffer.append(String.join(", ", defaultLifecyclePhases.get(key)));
                         descriptionBuffer.append(LS);
                     }
                 }
 
                 descriptionBuffer.append(LS);
                 descriptionBuffer.append("It is a part of the lifecycle for the POM packaging '");
-                descriptionBuffer.append(project.getPackaging());
+                descriptionBuffer.append(project.getPackaging().id());
                 descriptionBuffer.append("'. This lifecycle includes the following phases:");
                 descriptionBuffer.append(LS);
                 for (String key : phases) {
                     descriptionBuffer.append("* ").append(key).append(": ");
-                    LifecyclePhase phase = defaultLifecyclePhases.get(key);
-                    if (phase != null && !phase.getMojos().isEmpty()) {
-                        descriptionBuffer
-                                .append(phase.getMojos().stream()
-                                        .map(LifecycleMojo::getGoal)
-                                        .collect(Collectors.joining(", ")))
-                                .append(LS);
+                    List<String> goals = defaultLifecyclePhases.get(key);
+                    if (goals != null && !goals.isEmpty()) {
+                        descriptionBuffer.append(String.join(", ", goals)).append(LS);
                     } else {
                         descriptionBuffer.append(NOT_DEFINED).append(LS);
                     }
                 }
             } else {
                 descriptionBuffer.append("'").append(cmd);
-                descriptionBuffer.append("' is a phase within the '").append(lifecycle.getId());
+                descriptionBuffer.append("' is a phase within the '").append(lifecycle.id());
                 descriptionBuffer.append("' lifecycle, which has the following phases: ");
                 descriptionBuffer.append(LS);
 
                 for (String key : phases) {
                     descriptionBuffer.append("* ").append(key).append(": ");
-                    if (lifecycle.getDefaultLifecyclePhases().get(key) != null) {
+                    if (lifecycleBindings.get(key) != null) {
                         descriptionBuffer
-                                .append(lifecycle.getDefaultLifecyclePhases().get(key))
+                                .append(String.join(", ", lifecycleBindings.get(key)))
                                 .append(LS);
                     } else {
                         descriptionBuffer.append(NOT_DEFINED).append(LS);
@@ -703,52 +870,89 @@ public class DescribeMojo extends AbstractHelpMojo {
             return false;
         }
 
-        // goals
-        MojoDescriptor mojoDescriptor;
-        try {
-            mojoDescriptor = mojoDescriptorCreator.getMojoDescriptor(cmd, session, project);
-        } catch (Exception e) {
-            throw new MojoExecutionException("Unable to get descriptor for " + cmd, e);
+        // goals: prefix:goal, groupId:artifactId:goal or groupId:artifactId:version:goal
+        String[] parts = cmd.split(":");
+        switch (parts.length) {
+            case 2:
+                plugin = parts[0];
+                break;
+            case 3:
+                plugin = parts[0] + ":" + parts[1];
+                break;
+            case 4:
+                plugin = parts[0] + ":" + parts[1] + ":" + parts[2];
+                break;
+            default:
+                throw new MojoException("Unable to get descriptor for " + cmd);
         }
+        goal = parts[parts.length - 1];
         descriptionBuffer
                 .append("'")
                 .append(cmd)
                 .append("' is a plugin goal (aka mojo)")
                 .append(".");
         descriptionBuffer.append(LS);
-        plugin = mojoDescriptor.getPluginDescriptor().getId();
-        goal = mojoDescriptor.getGoal();
 
         return true;
     }
 
     /**
-     * Splits and wraps display text without depending on the generated help mojo implementation.
-     *
-     * @param text       the text to split
-     * @param indent     the base indentation level of each line
-     * @param indentSize the size of each indentation
-     * @param lineLength the maximum line length
-     * @return the display lines
-     * @throws MojoFailureException if the requested indentation cannot be represented safely
+     * @param plugins the plugins bound to a phase of a lifecycle
+     * @param phase the phase
+     * @return the goals of the plugins, as <code>groupId:artifactId[:version]:goal</code>
      */
-    private static List<String> toLines(String text, int indent, int indentSize, int lineLength)
-            throws MojoFailureException {
+    private static List<String> goals(List<Plugin> plugins, String phase) {
+        List<String> goals = new ArrayList<>();
+        for (Plugin p : plugins) {
+            for (PluginExecution execution : p.getExecutions()) {
+                for (String g : execution.getGoals()) {
+                    goals.add(p.getGroupId() + ":" + p.getArtifactId()
+                            + (p.getVersion() != null ? ":" + p.getVersion() : "") + ":" + g);
+                }
+            }
+        }
+        return goals;
+    }
+
+    /**
+     * Splits the specified text into lines of convenient display length.
+     *
+     * @param text       The text to split into lines, must not be <code>null</code>.
+     * @param indent     The base indentation level of each line, must not be negative.
+     * @param indentSize The size of each indentation, must not be negative.
+     * @param lineLength The length of the line, must not be negative.
+     * @return The sequence of display lines, never <code>null</code>.
+     * @throws MojoException if the requested indentation cannot be represented safely
+     */
+    private static List<String> toLines(String text, int indent, int indentSize, int lineLength) {
         List<String> lines = new ArrayList<>();
+
         String ind = repeat("\t", indent);
 
-        for (String plainLine : text.split("(\r\n)|(\r)|(\n)")) {
-            addLines(lines, ind + plainLine, indentSize, lineLength);
+        String[] plainLines = text.split("(\r\n)|(\r)|(\n)");
+
+        for (String plainLine : plainLines) {
+            toLines(lines, ind + plainLine, indentSize, lineLength);
         }
+
         return lines;
     }
 
-    private static void addLines(List<String> lines, String line, int indentSize, int lineLength)
-            throws MojoFailureException {
+    /**
+     * Adds the specified line to the output sequence, performing line wrapping if necessary.
+     *
+     * @param lines      The sequence of display lines, must not be <code>null</code>.
+     * @param line       The line to add, must not be <code>null</code>.
+     * @param indentSize The size of each indentation, must not be negative.
+     * @param lineLength The length of the line, must not be negative.
+     */
+    private static void toLines(List<String> lines, String line, int indentSize, int lineLength) {
         int lineIndent = getIndentLevel(line);
         StringBuilder buf = new StringBuilder(256);
 
-        for (String token : line.split(" +")) {
+        String[] tokens = line.split(" +");
+
+        for (String token : tokens) {
             if (buf.length() > 0) {
                 if (buf.length() + token.length() >= lineLength) {
                     lines.add(buf.toString());
@@ -758,11 +962,12 @@ public class DescribeMojo extends AbstractHelpMojo {
                     buf.append(' ');
                 }
             }
+
             for (int j = 0; j < token.length(); j++) {
                 char c = token.charAt(j);
                 if (c == '\t') {
-                    buf.append(repeat(" ", indentSize - buf.length() % indentSize));
-                } else if (c == '\u00A0') {
+                    buf.append(" ".repeat(indentSize - buf.length() % indentSize));
+                } else if (c == ' ') {
                     buf.append(' ');
                 } else {
                     buf.append(c);
@@ -772,6 +977,19 @@ public class DescribeMojo extends AbstractHelpMojo {
         lines.add(buf.toString());
     }
 
+    private static String repeat(String str, int count) {
+        if (count < 0 || ((long) count * str.length()) >= Integer.MAX_VALUE) {
+            throw new MojoException("Requested indentation is too large");
+        }
+        return str.repeat(count);
+    }
+
+    /**
+     * Gets the indentation level of the specified line.
+     *
+     * @param line The line whose indentation level should be retrieved, must not be <code>null</code>.
+     * @return The indentation level of the line.
+     */
     private static int getIndentLevel(String line) {
         int level = 0;
         for (int i = 0; i < line.length() && line.charAt(i) == '\t'; i++) {
@@ -786,17 +1004,6 @@ public class DescribeMojo extends AbstractHelpMojo {
         return level;
     }
 
-    private static String repeat(String str, int repeat) throws MojoFailureException {
-        if (repeat < 0 || ((long) repeat * str.length()) >= Integer.MAX_VALUE) {
-            throw new MojoFailureException("Requested indentation is too large");
-        }
-        StringBuilder result = new StringBuilder((int) ((long) repeat * str.length()));
-        for (int i = 0; i < repeat; i++) {
-            result.append(str);
-        }
-        return result.toString();
-    }
-
     /**
      * Append a description to the buffer by respecting the indentSize and lineLength parameters.
      * <b>Note</b>: The last character is always a new line.
@@ -804,12 +1011,8 @@ public class DescribeMojo extends AbstractHelpMojo {
      * @param sb          The buffer to append the description, not <code>null</code>.
      * @param description The description, not <code>null</code>.
      * @param indent      The base indentation level of each line, must not be negative.
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
-     * @see #toLines(String, int, int, int)
      */
-    private static void append(StringBuilder sb, String description, int indent)
-            throws MojoFailureException, MojoExecutionException {
+    private static void append(StringBuilder sb, String description, int indent) {
         if (description == null || description.isEmpty()) {
             sb.append(UNKNOWN).append(LS);
             return;
@@ -828,12 +1031,8 @@ public class DescribeMojo extends AbstractHelpMojo {
      * @param key    The key, not <code>null</code>.
      * @param value  The value associated to the key, could be <code>null</code>.
      * @param indent The base indentation level of each line, must not be negative.
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
-     * @see #toLines(String, int, int, int)
      */
-    private static void append(StringBuilder sb, String key, String value, int indent)
-            throws MojoFailureException, MojoExecutionException {
+    private static void append(StringBuilder sb, String key, String value, int indent) {
         if (key == null || key.isEmpty()) {
             throw new IllegalArgumentException("Key is required!");
         }
@@ -857,12 +1056,8 @@ public class DescribeMojo extends AbstractHelpMojo {
      * @param key    The key, not <code>null</code>.
      * @param value  The value, could be <code>null</code>.
      * @param indent The base indentation level of each line, must not be negative.
-     * @throws MojoFailureException   if any reflection exceptions occur.
-     * @throws MojoExecutionException if any
-     * @see #toLines(String, int, int, int)
      */
-    private static void appendAsParagraph(StringBuilder sb, String key, String value, int indent)
-            throws MojoFailureException, MojoExecutionException {
+    private static void appendAsParagraph(StringBuilder sb, String key, String value, int indent) {
         if (value == null || value.isEmpty()) {
             value = UNKNOWN;
         }
@@ -883,41 +1078,50 @@ public class DescribeMojo extends AbstractHelpMojo {
     }
 
     /**
-     * Determines if this Mojo should be used as a report or not. This resolves the plugin project along with all of its
+     * Determines if this Mojo should be used as a report or not. This resolves the plugin along with all of its
      * transitive dependencies to determine if the Java class of this goal implements <code>MavenReport</code>.
      *
+     * @param loaded the plugin descriptor
      * @param md Mojo descriptor
      * @return Whether or not this goal should be used as a report.
      */
-    private boolean isReportGoal(MojoDescriptor md) {
-        PluginDescriptor pd = md.getPluginDescriptor();
-        List<URL> urls = new ArrayList<>();
-        ProjectBuildingRequest pbr = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
-        pbr.setRemoteRepositories(project.getRemoteArtifactRepositories());
-        pbr.setPluginArtifactRepositories(project.getPluginArtifactRepositories());
-        pbr.setResolveDependencies(true);
-        pbr.setProject(null);
-        pbr.setValidationLevel(ModelBuildingRequest.VALIDATION_LEVEL_MINIMAL);
+    private boolean isReportGoal(LoadedPlugin loaded, MojoDescriptor md) {
+        PluginDescriptor pd = loaded.descriptor;
         try {
-            Artifact jar = resolveArtifact(
-                            new DefaultArtifact(pd.getGroupId(), pd.getArtifactId(), "jar", pd.getVersion()),
-                            project.getRemotePluginRepositories())
-                    .getArtifact();
-            Artifact pom = resolveArtifact(
-                            new DefaultArtifact(pd.getGroupId(), pd.getArtifactId(), "pom", pd.getVersion()),
-                            project.getRemotePluginRepositories())
-                    .getArtifact();
-            MavenProject mavenProject = projectBuilder.build(pom.getFile(), pbr).getProject();
-            urls.add(jar.getFile().toURI().toURL());
-            for (String artifact : mavenProject.getCompileClasspathElements()) {
-                urls.add(new File(artifact).toURI().toURL());
+            List<RemoteRepository> repositories =
+                    session.getService(ProjectManager.class).getRemotePluginRepositories(project);
+            Coordinates coordinates = new Coordinates(pd.getGroupId(), pd.getArtifactId(), pd.getVersion());
+            Path jar = resolveArtifactPath(coordinates, "jar", repositories);
+            List<URL> urls = new ArrayList<>();
+            urls.add(jar.toUri().toURL());
+            List<Path> classpath;
+            try {
+                Path pom = resolveArtifactPath(coordinates, "pom", repositories);
+                Project pluginProject = session.getService(ProjectBuilder.class)
+                        .build(ProjectBuilderRequest.builder()
+                                .session(session)
+                                .path(pom)
+                                .build())
+                        .getProject()
+                        .orElseThrow(() -> new MojoException("No project was built for " + pom));
+                // the compile classpath of the plugin: it has the Maven API the goal implements or extends
+                classpath = session.resolveDependencies(pluginProject, PathScope.MAIN_COMPILE);
+            } catch (RuntimeException e) {
+                // an old POM that Maven 4 cannot build: the runtime dependencies are all there is
+                log.debug("Cannot build the POM of " + pd.getId() + ", using its runtime dependencies", e);
+                classpath = session.resolveDependencies(
+                        session.createDependencyCoordinates(session.createArtifactCoordinates(
+                                pd.getGroupId(), pd.getArtifactId(), pd.getVersion(), "jar")));
+            }
+            for (Path path : classpath) {
+                urls.add(path.toUri().toURL());
             }
             try (URLClassLoader classLoader =
                     new URLClassLoader(urls.toArray(new URL[0]), getClass().getClassLoader())) {
                 return MavenReport.class.isAssignableFrom(Class.forName(md.getImplementation(), false, classLoader));
             }
-        } catch (Exception e) {
-            getLog().warn("Couldn't identify if this goal is a report goal: " + e.getMessage());
+        } catch (Exception | LinkageError e) {
+            log.warn("Couldn't identify if this goal is a report goal: " + e.getMessage());
             return false;
         }
     }
@@ -934,16 +1138,6 @@ public class DescribeMojo extends AbstractHelpMojo {
         }
 
         return "(no description available)";
-    }
-
-    /**
-     * Creates a new message buffer. Encapsulates the deprecated {@code MessageUtils} and {@code MessageBuilder} usage.
-     *
-     * @return a new message buffer
-     */
-    @SuppressWarnings("deprecation")
-    private static org.apache.maven.shared.utils.logging.MessageBuilder buffer() {
-        return org.apache.maven.shared.utils.logging.MessageUtils.buffer();
     }
 
     /**

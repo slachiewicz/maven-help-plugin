@@ -18,17 +18,14 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Properties;
+import java.util.TreeMap;
 
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.project.ProjectBuilder;
-import org.codehaus.plexus.util.cli.CommandLineUtils;
-import org.eclipse.aether.RepositorySystem;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
 
 /**
  * Displays a list of the platform details like system properties and environment variables.
@@ -36,24 +33,17 @@ import org.eclipse.aether.RepositorySystem;
  * @author <a href="mailto:vincent.siveton@gmail.com">Vincent Siveton</a>
  * @since 2.1
  */
-@Mojo(name = "system", requiresProject = false)
+@Mojo(name = "system", projectRequired = false)
 public class SystemMojo extends AbstractHelpMojo {
 
-    @Inject
-    public SystemMojo(ProjectBuilder projectBuilder, RepositorySystem repositorySystem) {
-        super(projectBuilder, repositorySystem);
-    }
-
-    /** Magic number to beautify the output */
     private static final int REPEAT = 25;
 
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
-    /** {@inheritDoc} */
     @Override
-    public void execute() throws MojoExecutionException {
+    public void execute() throws MojoException {
         StringBuilder message = new StringBuilder();
 
         message.append(LS);
@@ -78,10 +68,9 @@ public class SystemMojo extends AbstractHelpMojo {
         message.append(repeat("=", LINE_LENGTH)).append(LS);
         message.append("Environment Variables").append(LS);
         message.append(repeat("=", LINE_LENGTH)).append(LS);
-        Properties envVars = CommandLineUtils.getSystemEnvVars();
-        for (String key : envVars.stringPropertyNames()) {
+        for (Map.Entry<String, String> envVar : new TreeMap<>(System.getenv()).entrySet()) {
             message.append(LS);
-            message.append(key).append("=").append(envVars.getProperty(key));
+            message.append(envVar.getKey()).append("=").append(envVar.getValue());
         }
 
         message.append(LS);
@@ -92,17 +81,17 @@ public class SystemMojo extends AbstractHelpMojo {
             sb.append("See: https://maven.apache.org/plugins/maven-help-plugin/")
                     .append(LS)
                     .append(LS);
-            sb.append(message.toString());
+            sb.append(message);
 
             try {
                 writeFile(output, sb);
             } catch (IOException e) {
-                throw new MojoExecutionException("Cannot write system report to output: " + output, e);
+                throw new MojoException("Cannot write system report to output: " + output, e);
             }
 
-            getLog().info("System report written to: " + output);
+            log.info("System report written to: " + output);
         } else {
-            getLog().info(message);
+            log.info(message);
         }
     }
 

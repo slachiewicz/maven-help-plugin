@@ -18,68 +18,44 @@
  */
 package org.apache.maven.plugins.help;
 
-import javax.inject.Inject;
-
 import java.io.IOException;
-import java.util.List;
 
-import org.apache.maven.lifecycle.DefaultLifecycles;
-import org.apache.maven.lifecycle.Lifecycle;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.project.ProjectBuilder;
-import org.eclipse.aether.RepositorySystem;
+import org.apache.maven.api.Lifecycle;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.services.LifecycleRegistry;
 
 /**
  * Displays the list of all lifecycle phases that are defined in Maven.
  *
  * @since 3.5.2
  */
-@Mojo(name = "list-lifecycle-phases", requiresProject = false, aggregator = true)
+@Mojo(name = "list-lifecycle-phases", projectRequired = false, aggregator = true)
 public class ListLifecyclePhasesMojo extends AbstractHelpMojo {
-    /**
-     * The Maven default built-in lifecycles.
-     */
-    private final DefaultLifecycles defaultLifecycles;
-
-    @Inject
-    public ListLifecyclePhasesMojo(
-            ProjectBuilder projectBuilder, RepositorySystem repositorySystem, DefaultLifecycles defaultLifecycles) {
-        super(projectBuilder, repositorySystem);
-        this.defaultLifecycles = defaultLifecycles;
-    }
-
-    // ----------------------------------------------------------------------
-    // Mojo parameters
-    // ----------------------------------------------------------------------
 
     // ----------------------------------------------------------------------
     // Public methods
     // ----------------------------------------------------------------------
 
-    /**
-     * {@inheritDoc}
-     */
     @Override
-    public void execute() throws MojoExecutionException, MojoFailureException {
+    public void execute() throws MojoException {
         try {
             StringBuilder descriptionBuffer = new StringBuilder();
-            List<Lifecycle> lifecycles = defaultLifecycles.getLifeCycles();
-            for (Lifecycle lifecycle : lifecycles) {
-                descriptionBuffer.append(lifecycle.getId()).append(LS);
-                lifecycle
-                        .getPhases()
+            LifecycleRegistry lifecycleRegistry = session.getService(LifecycleRegistry.class);
+            for (Lifecycle lifecycle : lifecycleRegistry) {
+                descriptionBuffer.append(lifecycle.id()).append(LS);
+                lifecycleRegistry
+                        .computePhases(lifecycle)
                         .forEach(p -> descriptionBuffer.append(" * ").append(p).append(LS));
                 descriptionBuffer.append(LS);
             }
             if (output != null) {
                 writeFile(output, descriptionBuffer);
             } else {
-                getLog().info(LS + "Maven lifecycles defined:" + LS + LS + descriptionBuffer);
+                log.info(LS + "Maven lifecycles defined:" + LS + LS + descriptionBuffer);
             }
         } catch (IOException e) {
-            throw new MojoFailureException(e);
+            throw new MojoException(e);
         }
     }
 }
