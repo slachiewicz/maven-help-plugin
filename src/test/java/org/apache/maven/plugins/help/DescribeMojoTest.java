@@ -159,6 +159,17 @@ class DescribeMojoTest {
     }
 
     @Test
+    void testToLinesRejectsOverflowingIndentation() throws Exception {
+        Method toLines = DescribeMojo.class.getDeclaredMethod("toLines", String.class, int.class, int.class, int.class);
+        toLines.setAccessible(true);
+
+        InvocationTargetException exception = assertThrows(
+                InvocationTargetException.class, () -> toLines.invoke(null, "text", Integer.MAX_VALUE, 2, 80));
+
+        assertTrue(exception.getCause() instanceof MojoException);
+    }
+
+    @Test
     void testGetExpressionsRoot()
             throws NoSuchMethodException, SecurityException, IllegalAccessException, IllegalArgumentException,
                     InvocationTargetException {

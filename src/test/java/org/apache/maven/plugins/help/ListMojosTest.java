@@ -45,6 +45,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -55,16 +57,20 @@ class ListMojosTest {
 
     private final Session session = mock(Session.class);
 
+    private final Log log = mock(Log.class);
+
     @TempDir
     private Path tempDir;
 
     private void prepare(AbstractHelpMojo mojo) throws Exception {
         setVariableValueToObject(mojo, "session", session);
-        setVariableValueToObject(mojo, "log", mock(Log.class));
+        setVariableValueToObject(mojo, "log", log);
         setVariableValueToObject(mojo, "output", tempDir.resolve("out.txt"));
     }
 
     private String output() throws Exception {
+        // with an output file configured, nothing goes to the log
+        verify(log, never()).info(anyString());
         return Files.readString(tempDir.resolve("out.txt"));
     }
 

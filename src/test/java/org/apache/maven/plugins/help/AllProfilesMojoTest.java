@@ -37,6 +37,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.apache.maven.api.plugin.testing.MojoExtension.setVariableValueToObject;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -62,13 +63,16 @@ class AllProfilesMojoTest {
     private final List<Profile> projectProfiles = new ArrayList<>();
     private final List<Profile> projectActiveProfiles = new ArrayList<>();
     private final List<org.apache.maven.api.settings.Profile> settingsProfiles = new ArrayList<>();
+    private final List<String> activeSettingsProfiles = new ArrayList<>();
 
     @BeforeEach
     void setup() throws IOException {
         when(session.getProjects()).thenReturn(List.of(project));
         when(session.getSettings())
-                .thenAnswer(
-                        i -> Settings.newBuilder().profiles(settingsProfiles).build());
+                .thenAnswer(i -> Settings.newBuilder()
+                        .profiles(settingsProfiles)
+                        .activeProfiles(activeSettingsProfiles)
+                        .build());
 
         when(project.getId()).thenReturn("org.apache.maven.test:test:1.0");
         when(project.getEffectiveActiveProfiles()).thenReturn(projectActiveProfiles);
@@ -128,24 +132,67 @@ class AllProfilesMojoTest {
     }
 
     /**
-     * Tests the case when active profiles are present in the parent POM.
+     * Tests that a parent profile injected into the current project is active.
      *
      * @throws Exception in case of errors.
      */
     @Test
     @InjectMojo(goal = "all-profiles")
-    void testProfileFromParentPom(AllProfilesMojo mojo) throws Exception {
+    void testInjectedProfileFromParentPom(AllProfilesMojo mojo) throws Exception {
         prepare(mojo);
-        Project parentProject = mock(Project.class);
-        when(parentProject.getDeclaredProfiles()).thenReturn(List.of(newPomProfile("pro-1", "pom")));
-        when(parentProject.getEffectiveActiveProfiles()).thenReturn(List.of(newPomProfile("pro-1", "pom")));
-        when(parentProject.getParent()).thenReturn(Optional.empty());
+        Project parentProject = newParentProject("pro-1");
         when(project.getParent()).thenReturn(Optional.of(parentProject));
+        projectActiveProfiles.add(newPomProfile("pro-1", "pom"));
 
         mojo.execute();
 
         String file = readOutput();
         assertTrue(file.contains("Profile Id: pro-1 (Active: true, Source: pom)"), file);
+        assertFalse(file.contains("Profile Id: pro-1 (Active: false, Source: pom)"), file);
+    }
+
+    /**
+     * Tests that a profile active only in the parent's build context is inactive for the current project.
+     *
+     * @throws Exception in case of errors.
+     */
+    @Test
+    @InjectMojo(goal = "all-profiles")
+    void testParentActiveProfileNotInjectedIntoProject(AllProfilesMojo mojo) throws Exception {
+        prepare(mojo);
+        Project parentProject = newParentProject("pro-1");
+        when(parentProject.getEffectiveActiveProfiles()).thenReturn(List.of(newPomProfile("pro-1", "pom")));
+        when(project.getParent()).thenReturn(Optional.of(parentProject));
+
+        mojo.execute();
+
+        String file = readOutput();
+        assertTrue(file.contains("Profile Id: pro-1 (Active: false, Source: pom)"), file);
+        assertFalse(file.contains("Profile Id: pro-1 (Active: true, Source: pom)"), file);
+    }
+
+    /**
+     * Tests that only injected profiles of more distant ancestors are active.
+     *
+     * @throws Exception in case of errors.
+     */
+    @Test
+    @InjectMojo(goal = "all-profiles")
+    void testInjectedProfileFromGrandparentPom(AllProfilesMojo mojo) throws Exception {
+        prepare(mojo);
+        Project parentProject = newParentProject("parent-profile");
+        Project grandparentProject = newParentProject("grandparent-profile");
+        when(parentProject.getParent()).thenReturn(Optional.of(grandparentProject));
+        when(project.getParent()).thenReturn(Optional.of(parentProject));
+        projectActiveProfiles.add(newPomProfile("grandparent-profile", "pom"));
+
+        mojo.execute();
+
+        String file = readOutput();
+        assertTrue(file.contains("Profile Id: grandparent-profile (Active: true, Source: pom)"), file);
+        assertFalse(file.contains("Profile Id: grandparent-profile (Active: false, Source: pom)"), file);
+        assertTrue(file.contains("Profile Id: parent-profile (Active: false, Source: pom)"), file);
+        assertFalse(file.contains("Profile Id: parent-profile (Active: true, Source: pom)"), file);
     }
 
     /**
@@ -157,16 +204,68 @@ class AllProfilesMojoTest {
     @InjectMojo(goal = "all-profiles")
     void testProfileFromSettings(AllProfilesMojo mojo) throws Exception {
         prepare(mojo);
-        projectActiveProfiles.add(newPomProfile("settings-1", "settings.xml"));
-
         settingsProfiles.add(newSettingsProfile("settings-1"));
         settingsProfiles.add(newSettingsProfile("settings-2"));
+        activeSettingsProfiles.add("settings-1");
 
         mojo.execute();
 
         String file = readOutput();
         assertTrue(file.contains("Profile Id: settings-1 (Active: true, Source: settings.xml)"), file);
         assertTrue(file.contains("Profile Id: settings-2 (Active: false, Source: settings.xml)"), file);
+    }
+
+    /**
+     * Tests that an active settings profile is not overwritten by an inactive parent profile with the same id.
+     *
+     * @throws Exception in case of errors.
+     */
+    @Test
+    @InjectMojo(goal = "all-profiles")
+    void testActiveSettingsProfileWithInactiveParentProfile(AllProfilesMojo mojo) throws Exception {
+        prepare(mojo);
+        Project parentProject = newParentProject("collision");
+        when(project.getParent()).thenReturn(Optional.of(parentProject));
+        settingsProfiles.add(newSettingsProfile("collision"));
+        activeSettingsProfiles.add("collision");
+        projectActiveProfiles.add(newPomProfile("collision", "settings.xml"));
+
+        mojo.execute();
+
+        String file = readOutput();
+        assertTrue(file.contains("Profile Id: collision (Active: true, Source: settings.xml)"), file);
+        assertFalse(file.contains("Profile Id: collision (Active: true, Source: pom)"), file);
+    }
+
+    /**
+     * Tests that the POM profile wins when the same id is injected from the settings and from a parent POM.
+     *
+     * @throws Exception in case of errors.
+     */
+    @Test
+    @InjectMojo(goal = "all-profiles")
+    void testActiveSettingsProfileWithActiveParentProfile(AllProfilesMojo mojo) throws Exception {
+        prepare(mojo);
+        Project parentProject = newParentProject("collision");
+        when(project.getParent()).thenReturn(Optional.of(parentProject));
+        settingsProfiles.add(newSettingsProfile("collision"));
+        activeSettingsProfiles.add("collision");
+        projectActiveProfiles.add(newPomProfile("collision", "settings.xml"));
+        projectActiveProfiles.add(newPomProfile("collision", "pom"));
+
+        mojo.execute();
+
+        String file = readOutput();
+        assertTrue(file.contains("Profile Id: collision (Active: true, Source: pom)"), file);
+        assertFalse(file.contains("Profile Id: collision (Active: true, Source: settings.xml)"), file);
+    }
+
+    private Project newParentProject(String profileId) {
+        Project parentProject = mock(Project.class);
+        when(parentProject.getDeclaredProfiles()).thenReturn(List.of(newPomProfile(profileId, "pom")));
+        when(parentProject.getEffectiveActiveProfiles()).thenReturn(List.of());
+        when(parentProject.getParent()).thenReturn(Optional.empty());
+        return parentProject;
     }
 
     private Profile newPomProfile(String id, String source) {
